@@ -1,0 +1,11 @@
+# Vtrue-thePlane — pure-PyTorch stack (NO custom CUDA, no detectron2, no old mmcv).
+# Works on any modern CUDA 12 / PyTorch 2.x image — that's the whole point.
+torch>=2.1
+timm>=1.0            # pretrained vision backbones (resnet50 / hrnet) — pip only, no CUDA build
+numpy>=1.24
+scipy>=1.10          # cKDTree for fast kNN edge graph
+Pillow>=10.0         # raster rendering
+ezdxf>=1.1           # DXF parsing at inference
+tqdm>=4.65
+huggingface_hub>=0.23  # dataset download
+tensorboard>=2.14
