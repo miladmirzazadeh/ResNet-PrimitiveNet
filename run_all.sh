@@ -12,6 +12,8 @@
 export RUN=${RUN:-/workspace/runs/v1}
 export HF_RESULT_REPO=${HF_RESULT_REPO:-miladmirza/vtrue-results}
 export DATA=${DATA:-/root/archcad}            # local SSD: fast extract, split, and per-epoch reads
+TB=${TIME_BUDGET:-5.5}                         # training-loop cap in hours (override: export TIME_BUDGET=...)
+EP=${EPOCHS:-45}
 mkdir -p "$RUN"
 cd "$(cd "$(dirname "$0")" && pwd)"           # repo root
 
@@ -58,8 +60,8 @@ fi
 
 # ---- train ----
 python -m vtrue.train --data "$DATA" --out "$RUN" \
-  --preset medium --batch 32 --max-prims 1024 --epochs 45 --workers 32 \
-  --auto-weight --flaw-frac 0.2 --lr 4e-4 --time-budget 7
+  --preset medium --batch 32 --max-prims 1024 --epochs "$EP" --workers 32 \
+  --auto-weight --flaw-frac 0.2 --lr 4e-4 --time-budget "$TB"
 
 # ---- eval ----
 python -m vtrue.eval --weights "$RUN/best.pt" --data "$DATA" \
