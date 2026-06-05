@@ -41,7 +41,8 @@ def legend():
 
 
 def lines_table(prims, pred):
-    return [{"id": f"L{i}", "label": ID2NAME.get(int(pred[i]), str(int(pred[i]))),
+    return [{"id": f"L{i}", "model_guess": ID2NAME.get(int(pred[i]), str(int(pred[i]))),
+             "layer": p.get("layer", ""),
              "coords": [round(p["x0"], 1), round(p["y0"], 1), round(p["x1"], 1), round(p["y1"], 1)]}
             for i, p in enumerate(prims)]
 
@@ -93,41 +94,59 @@ def render_original(prims, out, texts=None, figsize=(18, 14), dpi=160):
     return str(out)
 
 
-def build_components(prims, pred):
+def build_components(prims, pred, max_area_frac=0.22):
     """Group primitives by their source CAD block (the drafter's own grouping). Each
-    block instance (window/door/fixture/furniture) becomes one labelable object UFO#.
-    Loose lines (group=None, e.g. walls) are NOT components — they keep per-line labels."""
+    SMALL discrete block (window/door/fixture/furniture) becomes one labelable object
+    UFO#. Loose lines AND large/structural blocks (e.g. a wall drawn as a block, or a
+    block on a wall/grid/column layer) are NOT components — they keep per-line labels,
+    so walls stay segment-level (a wall block can contain an opening)."""
     from collections import defaultdict, Counter
     g2idx = defaultdict(list)
     for i, p in enumerate(prims):
         if p.get("group") is not None:
             g2idx[p["group"]].append(i)
+    if not g2idx:
+        return []
+    ax = [c for p in prims for c in (p["x0"], p["x1"])]; ay = [c for p in prims for c in (p["y0"], p["y1"])]
+    plan_area = max((max(ax) - min(ax)) * (max(ay) - min(ay)), 1.0)
+    struct = ("wall", "grid", "axis", "column", "beam")
     comps = []
-    for n, (g, idx) in enumerate(sorted(g2idx.items()), start=1):
+    for g, idx in sorted(g2idx.items()):
         xs = [c for i in idx for c in (prims[i]["x0"], prims[i]["x1"])]
         ys = [c for i in idx for c in (prims[i]["y0"], prims[i]["y1"])]
+        layer = Counter(prims[i]["layer"] for i in idx).most_common(1)[0][0]
+        area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+        if area > max_area_frac * plan_area or any(s in layer.lower() for s in struct):
+            continue                                  # structural block -> stay per-line (loose)
         comps.append({
-            "ufo": "UFO%d" % n, "members": idx,
+            "ufo": "UFO%d" % (len(comps) + 1), "members": idx,
             "bbox": [round(min(xs), 1), round(min(ys), 1), round(max(xs), 1), round(max(ys), 1)],
-            "layer": Counter(prims[i]["layer"] for i in idx).most_common(1)[0][0],
-            "block": prims[idx[0]].get("block", ""),
+            "layer": layer, "block": prims[idx[0]].get("block", ""),
             "model_guess": ID2NAME[int(Counter(int(pred[i]) for i in idx).most_common(1)[0][0])]})
     return comps
 
 
 def render_ufo(prims, pred, comps, out, figsize=(18, 14), dpi=160):
-    """Plan colored by model class, with each component's bbox + UFO# tag overlaid."""
-    fig, ax = plt.subplots(figsize=figsize)
-    for i, p in enumerate(prims):
-        ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]],
-                color=CLASS_COLOR[int(pred[i]) % NUM_CLASSES], lw=1.1)
+    """Plan in light gray (so tags read clearly), each component's bbox in red, and its
+    UFO# tag placed OUTSIDE the box with a leader line and an opaque background — tags no
+    longer overlap the geometry. Tags are staggered to avoid colliding with each other."""
     import matplotlib.patches as mpatches
-    for c in comps:
+    fig, ax = plt.subplots(figsize=figsize)
+    for p in prims:
+        ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]], color="0.6", lw=0.8)   # gray context
+    ax.set_aspect("equal")
+    ax.autoscale(); ymin, ymax = ax.get_ylim(); xmin, xmax = ax.get_xlim()
+    off = (ymax - ymin) * 0.035
+    for k, c in enumerate(comps):
         x0, y0, x1, y1 = c["bbox"]
-        ax.add_patch(mpatches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, ec="red", lw=1.0))
-        ax.text(x0, y1, c["ufo"], fontsize=8, color="red", ha="left", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="red", alpha=0.8))
-    ax.set_aspect("equal"); ax.axis("off")
+        ax.add_patch(mpatches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, ec="red", lw=1.3))
+        lx = (x0 + x1) / 2
+        ly = y1 + off * (1 + (k % 3))                  # stagger vertically to reduce collisions
+        ax.annotate(c["ufo"], xy=(lx, y1), xytext=(lx, ly), fontsize=9, color="red",
+                    ha="center", va="bottom", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="red", alpha=0.95),
+                    arrowprops=dict(arrowstyle="-", color="red", lw=0.7))
+    ax.axis("off")
     plt.tight_layout(); plt.savefig(out, dpi=dpi); plt.close(fig)
     return str(out)
 
@@ -182,27 +201,27 @@ LINES TABLE:
 {table}"""
 
 
-COMP_PROMPT = """You are labeling OBJECTS in an architectural CAD floor plan. Each object
-is a CAD block (a window, door, fixture, or piece of furniture) that the drafter grouped;
-on the TAGGED image it is boxed in red with a tag UFO1, UFO2, .... You also get the
-ORIGINAL image in native CAD colors (with text labels and brightened layers).
+COMP_PROMPT = """You are labeling OBJECTS in an architectural CAD floor plan. Each object is
+a CAD block (a window, door, fixture, or piece of furniture) that the drafter grouped; on the
+TAGGED image it is boxed in red with a tag UFO1, UFO2, ... (tags sit just outside each box with
+a leader line). You also get the ORIGINAL image in native CAD colors, with text labels.
 
-For each UFO you are given (JSON): its bounding box, the CAD layer it sits on, its block
-name, and the model's guess. Assign each UFO its TRUE class.
+Decide each object's TRUE class by READING THE DRAWING — the shape it makes, the native
+colors, and any nearby room/text label in the original image are your primary evidence.
+
+The JSON for each UFO gives its bounding box, its CAD layer, its block name, and the model's
+guess. Treat the LAYER NAME and the MODEL GUESS as HINTS ONLY, not as the answer:
+- Layers are often informative ('windows'->glass, 'doors'->a door, a fittings layer->toilet/
+  sink/bathtub, a furniture layer->table/chair/bed/sofa) BUT layers can be wrong or generic.
+- The model guess is just one signal and is frequently wrong on fixtures/furniture.
+If the hints and the drawing disagree, TRUST THE DRAWING. If a hint is missing, rely on shape.
 
 Valid classes (use EXACTLY one): {classes}
-
-Strong hints, in order:
-- The CAD layer name is usually definitive: layer 'windows' -> 'glass'; 'doors' -> the
-  matching door class; 'R-TOILET-KITCHEN FITTINGS' or a fixture layer -> 'toilet'/'sink'/
-  'bathtub'/...; a furniture layer -> 'table'/'chair'/'bed'/'sofa'. But a layer CAN be
-  mislabeled, so confirm with the drawn shape and any nearby text label.
-- The drawn shape and the room text labels in the original image.
 
 Components to label:
 {components}
 
-Respond with JSON ONLY: {{"labels":[{{"ufo":"UFO1","class":"glass","reason":"on layer windows"}}]}}
+Respond with JSON ONLY: {{"labels":[{{"ufo":"UFO1","class":"glass","reason":"shape = glazing bridging the wall; layer 'windows' agrees"}}]}}
 Label every UFO."""
 
 
