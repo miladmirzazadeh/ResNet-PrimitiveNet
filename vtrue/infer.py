@@ -165,13 +165,19 @@ def load_plan(path):
     return dxf_to_prims(path) if str(path).lower().endswith(".dxf") else load_chunk(path)
 
 
-def label_plan(model, prims, device="cpu", clean=True, rotate=True, verbose=True):
-    """Full inference: clean outliers -> de-skew -> predict. Returns (pred, prims)
-    where prims is the cleaned, ORIGINAL-orientation working set (pred[i] labels prims[i])."""
+def label_plan(model, prims, device="cpu", clean=True, rotate=True, split=True, verbose=True):
+    """Full inference: clean outliers -> split lines at junctions -> de-skew -> predict.
+    Returns (pred, prims) where prims is the cleaned+split, ORIGINAL-orientation working
+    set (pred[i] labels prims[i])."""
     if clean:
         n0 = len(prims); prims = dense_filter(prims)
         if verbose and len(prims) < n0:
             print(f"cleaned {n0 - len(prims)} outlier primitives (title block / border / stray marks)")
+    if split:
+        from vtrue.split import split_lines
+        n0 = len(prims); prims = split_lines(prims)
+        if verbose and len(prims) != n0:
+            print(f"split lines at junctions: {n0} -> {len(prims)} primitives")
     prims_model = prims
     if rotate:
         prims_model, deg = deskew(prims)
@@ -224,13 +230,15 @@ def main():
     ap.add_argument("--json-out", help="write structured prediction JSON (primitives + objects)")
     ap.add_argument("--no-clean", action="store_true", help="skip outlier-primitive removal")
     ap.add_argument("--no-rotate", action="store_true", help="skip auto de-skew")
+    ap.add_argument("--no-split", action="store_true", help="skip splitting lines at junctions")
     a = ap.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(a.weights, device)
     prims = load_plan(a.input)
     if not prims:
         print("no primitives in", a.input); return
-    pred, prims = label_plan(model, prims, device, clean=not a.no_clean, rotate=not a.no_rotate)
+    pred, prims = label_plan(model, prims, device, clean=not a.no_clean,
+                             rotate=not a.no_rotate, split=not a.no_split)
     print("classes:", {ID2NAME.get(int(k), k): v for k, v in sorted(Counter(pred).items())})
     rec = to_record(prims, pred)
     countable = [o for o in rec["objects"] if o["label"] not in ("wall", "axis_grid", "glass", "others")]
