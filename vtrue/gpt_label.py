@@ -334,8 +334,15 @@ def review_lines(prims, pred, idxs, images, model="gpt-5.5", tiled=False):
               "layer": prims[i].get("layer", ""),
               "coords": [round(prims[i]["x0"], 1), round(prims[i]["y0"], 1),
                          round(prims[i]["x1"], 1), round(prims[i]["y1"], 1)]} for i in idxs]
-    note = ("\nNOTE: the FIRST image is a whole-plan thumbnail for CONTEXT; the others are a "
-            "ZOOMED tile — only correct the lines listed in the table (they are in this tile).\n"
+    note = ("\nYou are reviewing ONE ZOOMED TILE of a larger plan. The images are, in order:\n"
+            "  (1) a whole-plan THUMBNAIL (model colors) — global context only.\n"
+            "  (2) the ZOOMED tile in NATIVE CAD colors with text labels — the ORIGINAL drawing\n"
+            "      of this area; your primary evidence.\n"
+            "  (3) the ZOOMED tile colored by current model class, with each loose line's id L#\n"
+            "      printed beside it.\n"
+            "The LINES TABLE below lists every loose line in THIS tile with its id, current class,\n"
+            "CAD LAYER and coords. Correct ONLY lines in the table; use the thumbnail just for\n"
+            "context (e.g. does an edge continue beyond the tile).\n"
             if tiled else "")
     prompt = note + LINE_PROMPT.format(legend=json.dumps(legend()), classes=CLASS_LIST, table=json.dumps(table))
     content = [{"type": "text", "text": prompt}] + [
