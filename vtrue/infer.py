@@ -64,6 +64,20 @@ def dxf_to_prims(path):
     return prims
 
 
+def dense_filter(prims, k=6.0):
+    """Drop far-flung outlier primitives (title blocks, borders, north arrows, stray
+    marks) that would wreck per-plan normalization. Keeps the median +/- k*MAD spatial
+    cluster. On clean 14m chunks this keeps everything; on real drawings it rescues the
+    framing — the difference between '0 walls' and the real plan."""
+    arr = to_arrays(prims)
+    cx, cy = arr["C"][:, 0], arr["C"][:, 1]
+    mx, my = np.median(cx), np.median(cy)
+    madx = np.median(np.abs(cx - mx)) * 1.4826 + 1e-6
+    mady = np.median(np.abs(cy - my)) * 1.4826 + 1e-6
+    keep = (np.abs(cx - mx) < k * madx) & (np.abs(cy - my) < k * mady)
+    return [p for p, kk in zip(prims, keep) if kk]
+
+
 def load_model(weights, device="cpu"):
     ck = torch.load(weights, map_location=device)
     a = ck.get("args", {})
@@ -125,12 +139,17 @@ def main():
     ap.add_argument("--weights", required=True)
     ap.add_argument("--input", required=True, help=".dxf or ArchCAD .json")
     ap.add_argument("--out", default="pred.png")
+    ap.add_argument("--no-clean", action="store_true", help="skip outlier-primitive removal")
     a = ap.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(a.weights, device)
     prims = dxf_to_prims(a.input) if a.input.lower().endswith(".dxf") else load_chunk(a.input)
     if not prims:
         print("no primitives in", a.input); return
+    if not a.no_clean:
+        n0 = len(prims); prims = dense_filter(prims)
+        if len(prims) < n0:
+            print(f"cleaned {n0 - len(prims)} outlier primitives (title block / border / stray marks)")
     pred, arr, lo, w, h = predict(model, prims, device)
     print("classes:", {ID2NAME.get(int(k), k): v for k, v in sorted(Counter(pred).items())})
     groups = group_objects(prims, pred, scale=float(math.hypot(w, h)))
