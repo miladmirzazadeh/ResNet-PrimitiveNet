@@ -60,6 +60,20 @@ def render(prims, pred, out, marked=False, figsize=(18, 14), dpi=160):
     return str(out)
 
 
+def render_original(prims, out, figsize=(18, 14), dpi=160):
+    """Native CAD view: each line in its ORIGINAL DXF color on a dark background (like a
+    CAD viewer). The drafter's colors carry intent GPT can use (red separator vs wall)."""
+    fig, ax = plt.subplots(figsize=figsize, facecolor="black")
+    ax.set_facecolor("black")
+    for p in prims:
+        rgb = p.get("rgb", (255, 255, 255))
+        ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]],
+                color=tuple(min(1.0, v / 255) for v in rgb), lw=1.0)
+    ax.set_aspect("equal"); ax.axis("off")
+    plt.tight_layout(); plt.savefig(out, dpi=dpi, facecolor="black"); plt.close(fig)
+    return str(out)
+
+
 def _b64(path):
     return base64.b64encode(Path(path).read_bytes()).decode()
 
@@ -76,12 +90,16 @@ def _chat(client, model, content):
 
 PROMPT = """You are auditing an auto-classified architectural CAD floor plan.
 
-You are given TWO images of the SAME plan plus a lines table:
-- CLEAN image: each line drawn in the color of its CURRENT class (legend below).
+You are given THREE images of the SAME plan plus a lines table:
+- ORIGINAL image: the plan in its NATIVE CAD colors (as the drafter drew it, dark bg).
+  These colors carry intent: e.g. a line drawn in RED is often a separator / partition /
+  zone boundary, NOT a structural wall; dashed or oddly-colored lines may be annotations
+  or fixtures. Use the original colors together with the geometry to decide the TRUE class.
+- CLEAN image: each line drawn in the color of its CURRENT (model) class (legend below).
 - MARKED image: the same lines, each tagged with its id (L0, L1, ...).
 - LINES TABLE (JSON): every line's id, current label, and coords [x0,y0,x1,y1].
 
-Color legend (current class -> color): {legend}
+Color legend for the CLEAN/MARKED images (current class -> color): {legend}
 Valid classes (use EXACTLY one of these strings): {classes}
 
 Read the drawing like an architect and decide what each line REALLY is. Then report
@@ -106,13 +124,14 @@ LINES TABLE:
 {table}"""
 
 
-def review_round(prims, pred, clean_img, marked_img, model="gpt-5.5"):
+def review_round(prims, pred, clean_img, marked_img, original_img, model="gpt-5.5"):
     from openai import OpenAI
     client = OpenAI()
     table = lines_table(prims, pred)
     prompt = PROMPT.format(legend=json.dumps(legend()), classes=CLASS_LIST, table=json.dumps(table))
     content = [
         {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(original_img)}"}},
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(clean_img)}"}},
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(marked_img)}"}},
     ]
@@ -130,11 +149,12 @@ def review_round(prims, pred, clean_img, marked_img, model="gpt-5.5"):
 
 def supervise(model, prims, pred, out_dir, iters=2, gpt_model="gpt-5.5", device="cpu"):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    original = render_original(prims, out / "original.png")     # native CAD colors (fixed)
     for it in range(iters):
         clean = render(prims, pred, out / f"clean_{it}.png", marked=False)
         marked = render(prims, pred, out / f"marked_{it}.png", marked=True)
         print(f"[round {it}] {len(prims)} lines -> {gpt_model} …")
-        ch = review_round(prims, pred, clean, marked, gpt_model)
+        ch = review_round(prims, pred, clean, marked, original, gpt_model)
         if not ch:
             print("  no changes; converged."); break
         for i, c in ch.items():

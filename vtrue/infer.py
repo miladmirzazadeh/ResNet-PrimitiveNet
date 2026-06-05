@@ -23,13 +23,38 @@ from vtrue.classes import ID2NAME, NUM_CLASSES
 
 
 def dxf_to_prims(path):
-    """Minimal DXF -> record list (same schema as archcad.load_chunk). sem=0 (unknown)."""
+    """Minimal DXF -> record list (same schema as archcad.load_chunk). sem=0 (unknown).
+    Captures each entity's native color ('rgb') so the original CAD view can be shown
+    to GPT — the drafter's colors carry intent (e.g. a red line = separator, not wall)."""
     import ezdxf
+    from ezdxf.colors import aci2rgb
     doc = ezdxf.readfile(path); msp = doc.modelspace()
     prims = []
+    cur = {"rgb": (255, 255, 255)}
+
+    def entity_rgb(e):
+        try:
+            if e.rgb:                                   # explicit true color
+                return tuple(int(v) for v in e.rgb)
+        except Exception:
+            pass
+        try:
+            c = int(e.dxf.color)
+            if c == 256:                                # BYLAYER
+                lay = doc.layers.get(e.dxf.layer)
+                if getattr(lay, "rgb", None):
+                    return tuple(int(v) for v in lay.rgb)
+                c = int(lay.color)
+            if c in (0, 7, 256):                        # byblock / default white
+                return (255, 255, 255)
+            return tuple(int(v) for v in aci2rgb(abs(c)))
+        except Exception:
+            return (255, 255, 255)
+
     def rec(t, x0, y0, x1, y1, cx, cy, r):
         prims.append({"t": t, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-                      "cx": cx, "cy": cy, "r": r, "sem": 0, "ins": ""})
+                      "cx": cx, "cy": cy, "r": r, "rgb": cur["rgb"], "sem": 0, "ins": ""})
+
     def walk(e, depth=0):
         dt = e.dxftype()
         if dt == "INSERT" and depth < 4:
@@ -39,6 +64,7 @@ def dxf_to_prims(path):
             except Exception:
                 pass
             return
+        cur["rgb"] = entity_rgb(e)
         try:
             if dt == "LINE":
                 a, b = e.dxf.start, e.dxf.end
