@@ -40,11 +40,35 @@ def legend():
     return {ID2NAME[i]: _hex(CLASS_COLOR[i]) for i in sorted(ID2NAME)}
 
 
-def lines_table(prims, pred):
+def lines_table(prims, pred, only_loose=False):
     return [{"id": f"L{i}", "model_guess": ID2NAME.get(int(pred[i]), str(int(pred[i]))),
              "layer": p.get("layer", ""),
              "coords": [round(p["x0"], 1), round(p["y0"], 1), round(p["x1"], 1), round(p["y1"], 1)]}
-            for i, p in enumerate(prims)]
+            for i, p in enumerate(prims) if not (only_loose and p.get("group") is not None)]
+
+
+def render_lines(prims, pred, out, figsize=(18, 14), dpi=170):
+    """Class-colored 'highlighted' plan with L# tags on the LOOSE lines only (block lines
+    are UFO objects, handled separately). Each tag is placed BESIDE its line (perpendicular
+    offset) with a faint background, so labels don't sit on top of the linework."""
+    fig, ax = plt.subplots(figsize=figsize)
+    for i, p in enumerate(prims):
+        ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]],
+                color=CLASS_COLOR[int(pred[i]) % NUM_CLASSES], lw=1.1)
+    ax.set_aspect("equal"); ax.autoscale()
+    span = max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]) or 1.0
+    off = span * 0.006
+    for i, p in enumerate(prims):
+        if p.get("group") is not None:
+            continue
+        mx, my = (p["x0"] + p["x1"]) / 2, (p["y0"] + p["y1"]) / 2
+        dx, dy = p["x1"] - p["x0"], p["y1"] - p["y0"]; L = (dx * dx + dy * dy) ** 0.5 or 1.0
+        nx, ny = -dy / L, dx / L                       # unit normal -> label sits beside the line
+        ax.text(mx + nx * off, my + ny * off, f"L{i}", fontsize=4, color="black",
+                ha="center", va="center",
+                bbox=dict(boxstyle="square,pad=0.04", fc="white", ec="none", alpha=0.55))
+    ax.axis("off"); plt.tight_layout(); plt.savefig(out, dpi=dpi); plt.close(fig)
+    return str(out)
 
 
 def render(prims, pred, out, marked=False, figsize=(18, 14), dpi=160):
@@ -165,40 +189,38 @@ def _chat(client, model, content):
         return client.chat.completions.create(**kw)
 
 
-PROMPT = """You are auditing an auto-classified architectural CAD floor plan.
+LINE_PROMPT = """You are correcting the per-line classification of the STRUCTURAL / LOOSE
+lines of an architectural CAD floor plan — walls, separators, glazing, beams, columns.
+(Furniture and fixtures are grouped objects handled separately; ignore them here.)
 
-You are given THREE images of the SAME plan plus a lines table:
-- ORIGINAL image: the plan in its NATIVE CAD colors (as the drafter drew it, dark bg).
-  These colors carry intent: e.g. a line drawn in RED is often a separator / partition /
-  zone boundary, NOT a structural wall; dashed or oddly-colored lines may be annotations
-  or fixtures. Use the original colors together with the geometry to decide the TRUE class.
-- CLEAN image: each line drawn in the color of its CURRENT (model) class (legend below).
-- MARKED image: the same lines, each tagged with its id (L0, L1, ...).
-- LINES TABLE (JSON): every line's id, current label, and coords [x0,y0,x1,y1].
+You get THREE images of the SAME plan, plus a JSON table of the loose lines:
+- ORIGINAL: the plan in its native CAD colors, with text labels (the drafter's intent).
+- HIGHLIGHTED: every line colored by its CURRENT model class (legend below).
+- MARKED: the same, with each loose line's id (L0, L1, ...) printed BESIDE it.
+- LINES TABLE: each loose line's id, current model class, CAD layer, and coords.
 
-Color legend for the CLEAN/MARKED images (current class -> color): {legend}
-Valid classes (use EXACTLY one of these strings): {classes}
+Your job: COMPARE the HIGHLIGHTED image to the ORIGINAL and find lines the model got WRONG,
+then return the corrections. Reason from the drawing; the layer name and the model class are
+HINTS ONLY — if they disagree with what you see, trust the drawing.
 
-Read the drawing like an architect and decide what each line REALLY is. Then report
-ONLY the lines whose label should CHANGE. Use the MARKED image to translate your
-visual judgment into line ids. Guidance:
-- A wall is one line, or TWO/THREE parallel lines a small distance apart (its faces).
-- A window ('glass') is a SHORT section of thin parallel lines that BRIDGES AN OPENING
-  in a wall, with solid wall on BOTH sides of it. Closely-spaced parallel lines are
-  NOT automatically glass: if they run continuously along a long edge / the building
-  perimeter (no opening), they are a WALL, not a window. Relabel such 'glass' -> 'wall'.
-- A door = a leaf line + its swing arc inside a wall opening.
-- Fixtures (toilet/sink/urinal/bathtub/squat_toilet), furniture (bed/sofa/table/chair),
-  stairs, columns, holes — name them by their drawn shape.
-- Lines mislabeled 'others' that clearly belong to a real class are the main target.
-- Leave a line out if it is already correct or you are unsure.
+Common corrections:
+- A wall colored as something else (or 'others') -> 'wall'.
+- Closely-spaced parallel lines that run continuously along a long edge are a WALL, not
+  'glass'; glazing ('glass') is only a SHORT section bridging an opening with wall on both
+  sides. Fix 'glass' that is really wall, and 'wall' that is really a window.
+- A red / distinctly-colored partition line in the original = a separator (often not a
+  load-bearing wall) — classify per what it is, not automatically 'wall'.
+- Lines wrongly in 'others' that clearly belong to a real structural class.
 
-Respond with JSON ONLY:
-{{"changes":[{{"id":"L12","from":"others","to":"toilet","reason":"rounded WC outline"}}]}}
-Every id MUST exist in the lines table.
+Color legend (current class -> color): {legend}
+Valid classes (use EXACTLY one): {classes}
 
-LINES TABLE:
-{table}"""
+LOOSE LINES TABLE:
+{table}
+
+Respond with JSON ONLY, listing ONLY the lines to change:
+{{"changes":[{{"id":"L12","to":"wall","reason":"continuous outer edge, model had glass"}}]}}
+Every id MUST exist in the table."""
 
 
 COMP_PROMPT = """You are labeling OBJECTS in an architectural CAD floor plan. Each object is
@@ -245,11 +267,12 @@ def review_components(comps, ufo_img, original_img, model="gpt-5.5"):
     return out
 
 
-def review_round(prims, pred, clean_img, marked_img, original_img, model="gpt-5.5"):
+def review_lines(prims, pred, clean_img, marked_img, original_img, model="gpt-5.5"):
+    """GPT #2 — fix mislabeled LOOSE lines (walls/separators/glazing). Returns {idx: class}."""
     from openai import OpenAI
     client = OpenAI()
-    table = lines_table(prims, pred)
-    prompt = PROMPT.format(legend=json.dumps(legend()), classes=CLASS_LIST, table=json.dumps(table))
+    table = lines_table(prims, pred, only_loose=True)
+    prompt = LINE_PROMPT.format(legend=json.dumps(legend()), classes=CLASS_LIST, table=json.dumps(table))
     content = [
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(original_img)}"}},
@@ -262,18 +285,20 @@ def review_round(prims, pred, clean_img, marked_img, original_img, model="gpt-5.
         cid = str(c.get("id", "")); to = c.get("to")
         if cid.startswith("L") and cid[1:].isdigit() and to in NAME2ID:
             idx = int(cid[1:])
-            if 0 <= idx < len(prims):
+            if 0 <= idx < len(prims) and prims[idx].get("group") is None:   # loose only
                 changes[idx] = NAME2ID[to]
-                print(f"  {cid}: {c.get('from')} -> {to}   ({str(c.get('reason',''))[:55]})")
+                print(f"  {cid}: -> {to}   ({str(c.get('reason', ''))[:55]})")
     return changes
 
 
 def supervise(model, prims, pred, out_dir, iters=1, gpt_model="gpt-5.5", device="cpu",
               input_path=None):
-    """Component-based GPT labeling: each CAD block (window/door/fixture/furniture) is one
-    UFO object that GPT labels as a whole (loose lines keep the transformer's per-line
-    labels). GPT reasons from the native CAD view (colors + text) + the UFO-tagged view +
-    each object's layer/block hints."""
+    """Two-stage GPT supervision:
+      GPT #1 (objects): label each CAD block (UFO#) from the original + UFO-boxed image.
+      GPT #2 (lines):   fix mislabeled LOOSE lines (walls/separators/glazing) by comparing
+                        the class-highlighted image to the original, using L#-marked image
+                        + per-line layers. Both treat layer/model output as hints and decide
+                        from the drawing."""
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     texts = []
     if input_path and str(input_path).lower().endswith(".dxf"):
@@ -284,22 +309,34 @@ def supervise(model, prims, pred, out_dir, iters=1, gpt_model="gpt-5.5", device=
             pass
     original = render_original(prims, out / "original.png", texts=texts)
     comps = build_components(prims, pred)
-    print(f"components (CAD blocks): {len(comps)}  | loose lines kept per-line: "
-          f"{sum(1 for p in prims if p.get('group') is None)}")
+    n_loose = sum(1 for p in prims if p.get("group") is None)
+    print(f"objects (CAD blocks): {len(comps)}  |  loose lines: {n_loose}")
+    labels = {}
+
+    # ---- GPT #1: label the block OBJECTS (original + UFO-boxed image) ----
     if comps:
         ufo = render_ufo(prims, pred, comps, out / "ufo.png")
-        print(f"-> {gpt_model} labeling {len(comps)} objects …")
+        print(f"[GPT-1 objects] {gpt_model} labeling {len(comps)} objects …")
         labels = review_components(comps, ufo, original, gpt_model)
         for c in comps:
             if c["ufo"] in labels:
                 cid = NAME2ID[labels[c["ufo"]]]
                 for i in c["members"]:
                     pred[i] = cid
+
+    # ---- GPT #2: fix the LOOSE LINES (highlighted vs original + L# marked + layers) ----
+    if n_loose:
+        clean = render(prims, pred, out / "highlighted.png", marked=False)
+        marked = render_lines(prims, pred, out / "marked_lines.png")
+        print(f"[GPT-2 lines] {gpt_model} reviewing {n_loose} loose lines …")
+        changes = review_lines(prims, pred, clean, marked, original, gpt_model)
+        for i, cid in changes.items():
+            pred[i] = cid
+
     render(prims, pred, out / "final.png", marked=False)
-    json.dump({"lines": lines_table(prims, pred),
-               "objects": [{**{k: c[k] for k in ("ufo", "bbox", "layer", "block")},
-                            "label": labels.get(c["ufo"], c["model_guess"]) if comps else c["model_guess"]}
-                           for c in comps]}, open(out / "labeled.json", "w"))
+    json.dump({"objects": [{**{k: c[k] for k in ("ufo", "bbox", "layer", "block")},
+                            "label": labels.get(c["ufo"], c["model_guess"])} for c in comps],
+               "lines": lines_table(prims, pred, only_loose=True)}, open(out / "labeled.json", "w"))
     print("final line classes:", dict(Counter(ID2NAME[int(c)] for c in pred)))
     print("done ->", out)
     return pred
