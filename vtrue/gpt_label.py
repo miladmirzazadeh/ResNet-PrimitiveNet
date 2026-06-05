@@ -33,7 +33,16 @@ def _b64(path):
     return base64.b64encode(Path(path).read_bytes()).decode()
 
 
-def review_round(rec, image_path, model_name="gpt-4o"):
+def _chat(client, model, messages):
+    """Robust call: newer models (gpt-5.x) reject custom temperature -> retry without it."""
+    kw = dict(model=model, messages=messages, response_format={"type": "json_object"})
+    try:
+        return client.chat.completions.create(temperature=0, **kw)
+    except Exception:
+        return client.chat.completions.create(**kw)
+
+
+def review_round(rec, image_path, model_name="gpt-5.5"):
     """One GPT pass. Returns {object_id: new_label} for objects GPT chooses to relabel."""
     from openai import OpenAI
     client = OpenAI()
@@ -55,13 +64,10 @@ def review_round(rec, image_path, model_name="gpt-4o"):
         "it is already correct. Respond with JSON only: "
         '{"corrections":[{"id":<int>,"label":"<class>","reason":"<short>"}]}'
     )
-    resp = client.chat.completions.create(
-        model=model_name, temperature=0,
-        response_format={"type": "json_object"},
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(image_path)}"}},
-        ]}])
+    resp = _chat(client, model_name, [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(image_path)}"}},
+    ]}])
     data = json.loads(resp.choices[0].message.content)
     out = {}
     for c in data.get("corrections", []):
@@ -88,7 +94,7 @@ def main():
     ap.add_argument("--input", required=True)
     ap.add_argument("--out-dir", default="gpt_out")
     ap.add_argument("--iters", type=int, default=2, help="GPT review rounds")
-    ap.add_argument("--model", default="gpt-4o")
+    ap.add_argument("--model", default="gpt-5.5")
     ap.add_argument("--no-rotate", action="store_true")
     a = ap.parse_args()
     if not os.environ.get("OPENAI_API_KEY"):
