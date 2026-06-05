@@ -194,51 +194,42 @@ def _b64(path):
     return base64.b64encode(Path(path).read_bytes()).decode()
 
 
-def _chat(client, model, content):
+def _chat(client, model, content, system=None):
     """Robust call: newer models (gpt-5.x) reject custom temperature -> retry without it."""
-    kw = dict(model=model, messages=[{"role": "user", "content": content}],
-              response_format={"type": "json_object"})
+    msgs = ([{"role": "system", "content": system}] if system else []) + \
+           [{"role": "user", "content": content}]
+    kw = dict(model=model, messages=msgs, response_format={"type": "json_object"})
     try:
         return client.chat.completions.create(temperature=0, **kw)
     except Exception:
         return client.chat.completions.create(**kw)
 
 
-LINE_PROMPT = """You are correcting the per-line classification of the STRUCTURAL / LOOSE
-lines of an architectural CAD floor plan — walls, separators, glazing, beams, columns.
-(Furniture and fixtures are grouped objects handled separately; ignore them here.)
+LINE_SYSTEM = """You are an expert architectural-CAD reviewer fixing per-line class labels.
+Decide each line from the DRAWING you are shown. The CAD layer and the current model class are
+HINTS, not answers — if a hint conflicts with what you see, trust the drawing. Be decisive; give
+your single best class.
 
-You get THREE images of the SAME plan, plus a JSON table of the loose lines:
-- ORIGINAL: the plan in its native CAD colors, with text labels (the drafter's intent).
-- HIGHLIGHTED: every line colored by its CURRENT model class (legend below).
-- MARKED: the same, with each loose line's id (L0, L1, ...) printed BESIDE it.
-- LINES TABLE: each loose line's id, current model class, CAD layer, and coords.
+Steps for each line in the table:
+1. Look at where the line is in the original (zoomed) drawing and what shape it forms with its
+   neighbours.
+2. Apply the rules below. 3. If it is already correct, leave it out.
 
-Your job: COMPARE the HIGHLIGHTED image to the ORIGINAL and find lines the model got WRONG,
-then return the corrections. Reason from the drawing; the layer name and the model class are
-HINTS ONLY — if they disagree with what you see, trust the drawing.
+Rules:
+- WALL: a long continuous edge, or 2-3 parallel lines a small fixed distance apart (wall faces).
+  A wall may be INCOMPLETE where a window or door sits in it — that is FINE; still label the wall
+  segments 'wall'. Do not try to complete it.
+- GLASS (window): a SHORT run of thin parallel lines BRIDGING an opening, with wall on BOTH sides.
+  Parallel lines that run a whole edge with no opening are WALL, not glass.
+- DOOR: a leaf line plus its swing arc inside a wall opening.
+- BEAM / COLUMN: trust the layer — a line on a 'Beam' layer is a beam, a 'column' layer a column,
+  even if it looks like a wall.
+- Furniture/fixture lines (e.g. a furniture / P-FURN layer) inside rooms are 'others' unless they
+  clearly form a specific fixture.
+- A line lying exactly on top of another (coincident duplicate) -> 'duplicate'.
 
-Common corrections:
-- A wall colored as something else (or 'others') -> 'wall'.
-- Closely-spaced parallel lines that run continuously along a long edge are a WALL, not
-  'glass'; glazing ('glass') is only a SHORT section bridging an opening with wall on both
-  sides. Fix 'glass' that is really wall, and 'wall' that is really a window.
-- USE THE LAYER: a line whose layer is 'Beam' is a beam ('concrete_beam'/'steel_beam'); a
-  'column' layer -> a column; a 'grid'/'axis' layer -> 'axis_grid' — even if the model
-  called it 'wall'. The original image often draws these in a distinct color too.
-- A red / distinctly-colored partition line in the original = a separator (often not a
-  load-bearing wall) — classify per what it is, not automatically 'wall'.
-- Lines wrongly in 'others' that clearly belong to a real structural class.
-
-Color legend (current class -> color): {legend}
 Valid classes (use EXACTLY one): {classes}
-
-LOOSE LINES TABLE:
-{table}
-
-Respond with JSON ONLY, listing ONLY the lines to change:
-{{"changes":[{{"id":"L12","to":"wall","reason":"continuous outer edge, model had glass"}}]}}
-Every id MUST exist in the table."""
+Output ONLY the lines whose class you change, as JSON."""
 
 
 COMP_PROMPT = """You are labeling OBJECTS in an architectural CAD floor plan. Each object is
@@ -327,27 +318,27 @@ def _tiles(prims, threshold=100, overlap=0.12):
 
 
 def review_lines(prims, pred, idxs, images, model="gpt-5.5", tiled=False):
-    """GPT #2 — fix mislabeled LOOSE lines among `idxs`, shown in `images`. Returns {idx:class}."""
+    """GPT #2 (single pass) — fix mislabeled LOOSE lines among `idxs`, shown in `images`.
+    Returns {idx: class}. Uses LINE_SYSTEM for the rules; the user message carries the data."""
     from openai import OpenAI
     client = OpenAI()
-    table = [{"id": f"L{i}", "model_guess": ID2NAME.get(int(pred[i]), str(int(pred[i]))),
+    table = [{"id": f"L{i}", "current": ID2NAME.get(int(pred[i]), str(int(pred[i]))),
               "layer": prims[i].get("layer", ""),
               "coords": [round(prims[i]["x0"], 1), round(prims[i]["y0"], 1),
                          round(prims[i]["x1"], 1), round(prims[i]["y1"], 1)]} for i in idxs]
-    note = ("\nYou are reviewing ONE ZOOMED TILE of a larger plan. The images are, in order:\n"
-            "  (1) a whole-plan THUMBNAIL (model colors) — global context only.\n"
-            "  (2) the ZOOMED tile in NATIVE CAD colors with text labels — the ORIGINAL drawing\n"
-            "      of this area; your primary evidence.\n"
-            "  (3) the ZOOMED tile colored by current model class, with each loose line's id L#\n"
-            "      printed beside it.\n"
-            "The LINES TABLE below lists every loose line in THIS tile with its id, current class,\n"
-            "CAD LAYER and coords. Correct ONLY lines in the table; use the thumbnail just for\n"
-            "context (e.g. does an edge continue beyond the tile).\n"
-            if tiled else "")
-    prompt = note + LINE_PROMPT.format(legend=json.dumps(legend()), classes=CLASS_LIST, table=json.dumps(table))
-    content = [{"type": "text", "text": prompt}] + [
+    desc = ("Images: (1) whole-plan THUMBNAIL (context only); (2) ZOOMED ORIGINAL of this tile in "
+            "native CAD colors + text (your evidence); (3) the same tile colored by current model "
+            "class with line ids L#. Correct ONLY lines in the table; they are in this tile."
+            if tiled else
+            "Images: (1) ORIGINAL native CAD colors + text (your evidence); (2) plan colored by "
+            "current model class; (3) the same with line ids L#.")
+    user = (desc + "\n\nLINES (id, current class, layer, coords):\n" + json.dumps(table) +
+            '\n\nReturn JSON only, ONLY the lines you change: '
+            '{"changes":[{"id":"L12","to":"wall","reason":"..."}]}. Every id must be in the table.')
+    content = [{"type": "text", "text": user}] + [
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(im)}"}} for im in images]
-    data = json.loads(_chat(client, model, content).choices[0].message.content)
+    data = json.loads(_chat(client, model, content,
+                            system=LINE_SYSTEM.format(classes=CLASS_LIST)).choices[0].message.content)
     allow = set(idxs); changes = {}
     for c in data.get("changes", []):
         cid = str(c.get("id", "")); to = c.get("to")
@@ -361,12 +352,13 @@ def review_lines(prims, pred, idxs, images, model="gpt-5.5", tiled=False):
 
 def supervise(model, prims, pred, out_dir, iters=3, gpt_model="gpt-5.5", device="cpu",
               input_path=None, tile_threshold=100):
-    """Two-stage GPT supervision:
+    """Two-stage GPT supervision, SINGLE PASS (no iteration — iterating made GPT oscillate on
+    ambiguous lines):
       GPT #1 (objects): label each CAD block (UFO#) from the original + UFO-boxed image.
-      GPT #2 (lines):   fix mislabeled LOOSE lines (walls/separators/glazing) by comparing
-                        the class-highlighted image to the original, using L#-marked image
-                        + per-line layers. Both treat layer/model output as hints and decide
-                        from the drawing."""
+      GPT #2 (lines):   one pass over the loose lines (walls/separators/glazing), reviewing
+                        zoomed tiles for dense plans; each loose line is reviewed exactly once.
+                        Rules live in LINE_SYSTEM; layer/model class are hints, decide from the
+                        drawing. Walls may be left incomplete (gaps at openings) — that's fine."""
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     texts = []
     if input_path and str(input_path).lower().endswith(".dxf"):
@@ -399,32 +391,26 @@ def supervise(model, prims, pred, out_dir, iters=3, gpt_model="gpt-5.5", device=
         tiles = _tiles(prims, threshold=tile_threshold)
         thumb = render(prims, pred, out / "context.png", marked=False)        # whole-plan context
         if tiles:
-            print(f"[GPT-2 lines] dense plan ({n_loose} > {tile_threshold}) -> {len(tiles)} zoomed tiles")
+            print(f"[GPT-2 lines] dense plan ({n_loose} > {tile_threshold}) -> {len(tiles)} zoomed tiles (single pass)")
+            seen = set()                                  # each loose line reviewed in ONE tile only
             for ti, b in enumerate(tiles):
-                idxs = [i for i, p in enumerate(prims) if p.get("group") is None and _in_bbox(p, b)]
+                idxs = [i for i, p in enumerate(prims)
+                        if p.get("group") is None and i not in seen and _in_bbox(p, b)]
                 if len(idxs) < 2:
                     continue
-                for it in range(max(1, iters)):
-                    hl = render_lines(prims, pred, out / f"tile{ti}_hl.png", bbox=b)
-                    org = render_original(prims, out / f"tile{ti}_orig.png", texts=texts, bbox=b)
-                    print(f"  tile {ti + 1}/{len(tiles)} · round {it + 1}: {len(idxs)} lines …")
-                    changes = review_lines(prims, pred, idxs, [thumb, org, hl], gpt_model, tiled=True)
-                    if not changes:
-                        break
-                    for i, cid in changes.items():
-                        pred[i] = cid
-        else:
-            print(f"[GPT-2 lines] not dense ({n_loose} <= {tile_threshold}) -> whole-plan review")
-            idxs = [i for i, p in enumerate(prims) if p.get("group") is None]
-            for it in range(max(1, iters)):
-                clean = render(prims, pred, out / "highlighted.png", marked=False)
-                marked = render_lines(prims, pred, out / "marked_lines.png")
-                print(f"[GPT-2 lines · round {it + 1}/{iters}] reviewing {n_loose} loose lines …")
-                changes = review_lines(prims, pred, idxs, [original, clean, marked], gpt_model)
-                if not changes:
-                    print("  no more changes — converged."); break
-                for i, cid in changes.items():
+                seen.update(idxs)
+                hl = render_lines(prims, pred, out / f"tile{ti}_hl.png", bbox=b)
+                org = render_original(prims, out / f"tile{ti}_orig.png", texts=texts, bbox=b)
+                print(f"  tile {ti + 1}/{len(tiles)}: {len(idxs)} lines …")
+                for i, cid in review_lines(prims, pred, idxs, [thumb, org, hl], gpt_model, tiled=True).items():
                     pred[i] = cid
+        else:
+            print(f"[GPT-2 lines] not dense ({n_loose} <= {tile_threshold}) -> whole-plan, single pass")
+            idxs = [i for i, p in enumerate(prims) if p.get("group") is None]
+            clean = render(prims, pred, out / "highlighted.png", marked=False)
+            marked = render_lines(prims, pred, out / "marked_lines.png")
+            for i, cid in review_lines(prims, pred, idxs, [original, clean, marked], gpt_model).items():
+                pred[i] = cid
 
     render(prims, pred, out / "final.png", marked=False)
     json.dump({"objects": [{**{k: c[k] for k in ("ufo", "bbox", "layer", "block")},
