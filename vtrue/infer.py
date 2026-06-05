@@ -78,6 +78,33 @@ def dense_filter(prims, k=6.0):
     return [p for p, kk in zip(prims, keep) if kk]
 
 
+def deskew(prims):
+    """Rotate the plan so its dominant wall direction is axis-aligned. The model was
+    trained only on axis-aligned ArchCAD chunks, so a tilted plan reads as 'others'.
+    Detects the dominant edge angle (length-weighted, folded to [0,90deg)) and rotates
+    by -that. Returns (rotated_prims, degrees)."""
+    arr = to_arrays(prims)
+    dx = arr["B"][:, 0] - arr["A"][:, 0]; dy = arr["B"][:, 1] - arr["A"][:, 1]
+    L = np.hypot(dx, dy); m = L > 1e-9
+    if m.sum() < 5:
+        return prims, 0.0
+    ang = np.arctan2(dy[m], dx[m]) % (np.pi / 2)
+    hist, edges = np.histogram(ang, bins=180, weights=L[m], range=(0, np.pi / 2))
+    dom = (edges[hist.argmax()] + edges[hist.argmax() + 1]) / 2
+    if dom > np.pi / 4:                       # rotate the short way
+        dom -= np.pi / 2
+    if abs(dom) < np.radians(0.8):
+        return prims, 0.0
+    c, s = np.cos(-dom), np.sin(-dom)
+    out = []
+    for p in prims:
+        q = dict(p)
+        for xk, yk in (("x0", "y0"), ("x1", "y1"), ("cx", "cy")):
+            x, y = p[xk], p[yk]; q[xk] = x * c - y * s; q[yk] = x * s + y * c
+        out.append(q)
+    return out, np.degrees(dom)
+
+
 def load_model(weights, device="cpu"):
     ck = torch.load(weights, map_location=device)
     a = ck.get("args", {})
@@ -134,37 +161,84 @@ def group_objects(prims, pred, tol_frac=0.01, scale=1.0):
     return [g for g in groups.values()]
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", required=True)
-    ap.add_argument("--input", required=True, help=".dxf or ArchCAD .json")
-    ap.add_argument("--out", default="pred.png")
-    ap.add_argument("--no-clean", action="store_true", help="skip outlier-primitive removal")
-    a = ap.parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = load_model(a.weights, device)
-    prims = dxf_to_prims(a.input) if a.input.lower().endswith(".dxf") else load_chunk(a.input)
-    if not prims:
-        print("no primitives in", a.input); return
-    if not a.no_clean:
-        n0 = len(prims); prims = dense_filter(prims)
-        if len(prims) < n0:
-            print(f"cleaned {n0 - len(prims)} outlier primitives (title block / border / stray marks)")
-    pred, arr, lo, w, h = predict(model, prims, device)
-    print("classes:", {ID2NAME.get(int(k), k): v for k, v in sorted(Counter(pred).items())})
-    groups = group_objects(prims, pred, scale=float(math.hypot(w, h)))
-    countable = [g for g in groups if ID2NAME.get(int(pred[g[0]]), "") not in ("wall", "axis_grid", "glass", "others")]
-    print(f"objects: {len(groups)} groups ({len(countable)} countable candidates for GPT)")
+def load_plan(path):
+    return dxf_to_prims(path) if str(path).lower().endswith(".dxf") else load_chunk(path)
 
+
+def label_plan(model, prims, device="cpu", clean=True, rotate=True, verbose=True):
+    """Full inference: clean outliers -> de-skew -> predict. Returns (pred, prims)
+    where prims is the cleaned, ORIGINAL-orientation working set (pred[i] labels prims[i])."""
+    if clean:
+        n0 = len(prims); prims = dense_filter(prims)
+        if verbose and len(prims) < n0:
+            print(f"cleaned {n0 - len(prims)} outlier primitives (title block / border / stray marks)")
+    prims_model = prims
+    if rotate:
+        prims_model, deg = deskew(prims)
+        if verbose and abs(deg) > 0.8:
+            print(f"de-skewed plan by {deg:.1f} deg for the model")
+    pred, _arr, _lo, _w, _h = predict(model, prims_model, device)
+    return pred, prims
+
+
+def to_record(prims, pred, scale=None):
+    """Structured prediction: primitives (id/type/coords/label) + object groups."""
+    import math as _m
+    if scale is None:
+        arr = to_arrays(prims); _, w, h = bbox(arr); scale = _m.hypot(w, h)
+    prim_recs = [{"id": i, "type": p["t"],
+                  "coords": [round(p["x0"], 2), round(p["y0"], 2), round(p["x1"], 2), round(p["y1"], 2)],
+                  "label": ID2NAME.get(int(pred[i]), str(int(pred[i])))} for i, p in enumerate(prims)]
+    groups = group_objects(prims, pred, scale=float(scale))
+    obj_recs = []
+    for j, g in enumerate(groups):
+        xs = [c for i in g for c in (prims[i]["x0"], prims[i]["x1"])]
+        ys = [c for i in g for c in (prims[i]["y0"], prims[i]["y1"])]
+        obj_recs.append({"id": j, "label": ID2NAME.get(int(pred[g[0]]), str(int(pred[g[0]]))),
+                         "n": len(g), "members": g,
+                         "bbox": [round(min(xs), 1), round(min(ys), 1), round(max(xs), 1), round(max(ys), 1)]})
+    return {"primitives": prim_recs, "objects": obj_recs}
+
+
+def render_preview(prims, pred, out, title="Vtrue prediction (color = class)", label_objs=None):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     rng = np.random.default_rng(0)
     colors = rng.random((NUM_CLASSES, 3)) * 0.7 + 0.15
     fig, ax = plt.subplots(figsize=(13, 10))
     for i, p in enumerate(prims):
-        c = colors[int(pred[i]) % NUM_CLASSES]
-        ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]], color=c, lw=1.1)
-    ax.set_aspect("equal"); ax.axis("off"); ax.set_title("Vtrue prediction (color = class)")
-    plt.tight_layout(); plt.savefig(a.out, dpi=120); print("preview ->", a.out)
+        ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]], color=colors[int(pred[i]) % NUM_CLASSES], lw=1.1)
+    if label_objs:                       # overlay object-id numbers (for GPT review)
+        for oid, (cx, cy) in label_objs.items():
+            ax.text(cx, cy, str(oid), fontsize=7, color="red", ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="red", alpha=0.7))
+    ax.set_aspect("equal"); ax.axis("off"); ax.set_title(title)
+    plt.tight_layout(); plt.savefig(out, dpi=120); plt.close(fig)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--weights", required=True)
+    ap.add_argument("--input", required=True, help=".dxf or ArchCAD .json")
+    ap.add_argument("--out", default="pred.png")
+    ap.add_argument("--json-out", help="write structured prediction JSON (primitives + objects)")
+    ap.add_argument("--no-clean", action="store_true", help="skip outlier-primitive removal")
+    ap.add_argument("--no-rotate", action="store_true", help="skip auto de-skew")
+    a = ap.parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = load_model(a.weights, device)
+    prims = load_plan(a.input)
+    if not prims:
+        print("no primitives in", a.input); return
+    pred, prims = label_plan(model, prims, device, clean=not a.no_clean, rotate=not a.no_rotate)
+    print("classes:", {ID2NAME.get(int(k), k): v for k, v in sorted(Counter(pred).items())})
+    rec = to_record(prims, pred)
+    countable = [o for o in rec["objects"] if o["label"] not in ("wall", "axis_grid", "glass", "others")]
+    print(f"objects: {len(rec['objects'])} groups ({len(countable)} countable candidates for GPT)")
+    if a.json_out:
+        import json
+        json.dump(rec, open(a.json_out, "w")); print("json ->", a.json_out)
+    render_preview(prims, pred, a.out); print("preview ->", a.out)
 
 
 if __name__ == "__main__":

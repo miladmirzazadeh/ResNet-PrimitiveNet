@@ -9,3 +9,4 @@ ezdxf>=1.1           # DXF parsing at inference
 tqdm>=4.65
 huggingface_hub>=0.23  # dataset download
 tensorboard>=2.14
+openai>=1.30        # GPT supervision layer (vtrue.gpt_label)
