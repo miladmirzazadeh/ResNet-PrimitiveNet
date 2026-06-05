@@ -208,6 +208,9 @@ Common corrections:
 - Closely-spaced parallel lines that run continuously along a long edge are a WALL, not
   'glass'; glazing ('glass') is only a SHORT section bridging an opening with wall on both
   sides. Fix 'glass' that is really wall, and 'wall' that is really a window.
+- USE THE LAYER: a line whose layer is 'Beam' is a beam ('concrete_beam'/'steel_beam'); a
+  'column' layer -> a column; a 'grid'/'axis' layer -> 'axis_grid' — even if the model
+  called it 'wall'. The original image often draws these in a distinct color too.
 - A red / distinctly-colored partition line in the original = a separator (often not a
   load-bearing wall) — classify per what it is, not automatically 'wall'.
 - Lines wrongly in 'others' that clearly belong to a real structural class.
@@ -231,12 +234,12 @@ a leader line). You also get the ORIGINAL image in native CAD colors, with text 
 Decide each object's TRUE class by READING THE DRAWING — the shape it makes, the native
 colors, and any nearby room/text label in the original image are your primary evidence.
 
-The JSON for each UFO gives its bounding box, its CAD layer, its block name, and the model's
-guess. Treat the LAYER NAME and the MODEL GUESS as HINTS ONLY, not as the answer:
+The JSON for each UFO gives its bounding box, its CAD layer, and its block name (NO prior
+label — you decide). Treat the LAYER NAME as a HINT ONLY:
 - Layers are often informative ('windows'->glass, 'doors'->a door, a fittings layer->toilet/
   sink/bathtub, a furniture layer->table/chair/bed/sofa) BUT layers can be wrong or generic.
-- The model guess is just one signal and is frequently wrong on fixtures/furniture.
-If the hints and the drawing disagree, TRUST THE DRAWING. If a hint is missing, rely on shape.
+Decide each object from its drawn SHAPE and any nearby text label in the original image; if
+the layer disagrees with what you see, TRUST THE DRAWING.
 
 Valid classes (use EXACTLY one): {classes}
 
@@ -251,7 +254,7 @@ def review_components(comps, ufo_img, original_img, model="gpt-5.5"):
     from openai import OpenAI
     client = OpenAI()
     compact = [{"ufo": c["ufo"], "bbox": c["bbox"], "layer": c["layer"],
-                "block": c["block"], "model_guess": c["model_guess"]} for c in comps]
+                "block": c["block"]} for c in comps]   # no model label -> GPT decides fresh
     prompt = COMP_PROMPT.format(classes=CLASS_LIST, components=json.dumps(compact))
     content = [
         {"type": "text", "text": prompt},
@@ -291,7 +294,7 @@ def review_lines(prims, pred, clean_img, marked_img, original_img, model="gpt-5.
     return changes
 
 
-def supervise(model, prims, pred, out_dir, iters=1, gpt_model="gpt-5.5", device="cpu",
+def supervise(model, prims, pred, out_dir, iters=3, gpt_model="gpt-5.5", device="cpu",
               input_path=None):
     """Two-stage GPT supervision:
       GPT #1 (objects): label each CAD block (UFO#) from the original + UFO-boxed image.
@@ -324,14 +327,18 @@ def supervise(model, prims, pred, out_dir, iters=1, gpt_model="gpt-5.5", device=
                 for i in c["members"]:
                     pred[i] = cid
 
-    # ---- GPT #2: fix the LOOSE LINES (highlighted vs original + L# marked + layers) ----
+    # ---- GPT #2: fix the LOOSE LINES, ITERATING (change only what's wrong, re-render,
+    #      look again) until GPT reports no more changes or we hit max iters ----
     if n_loose:
-        clean = render(prims, pred, out / "highlighted.png", marked=False)
-        marked = render_lines(prims, pred, out / "marked_lines.png")
-        print(f"[GPT-2 lines] {gpt_model} reviewing {n_loose} loose lines …")
-        changes = review_lines(prims, pred, clean, marked, original, gpt_model)
-        for i, cid in changes.items():
-            pred[i] = cid
+        for it in range(max(1, iters)):
+            clean = render(prims, pred, out / "highlighted.png", marked=False)
+            marked = render_lines(prims, pred, out / "marked_lines.png")
+            print(f"[GPT-2 lines · round {it + 1}/{iters}] reviewing {n_loose} loose lines …")
+            changes = review_lines(prims, pred, clean, marked, original, gpt_model)
+            if not changes:
+                print("  no more changes — converged."); break
+            for i, cid in changes.items():
+                pred[i] = cid
 
     render(prims, pred, out / "final.png", marked=False)
     json.dump({"objects": [{**{k: c[k] for k in ("ufo", "bbox", "layer", "block")},
@@ -347,7 +354,7 @@ def main():
     ap.add_argument("--weights", required=True)
     ap.add_argument("--input", required=True)
     ap.add_argument("--out-dir", default="gpt_out")
-    ap.add_argument("--iters", type=int, default=2)
+    ap.add_argument("--iters", type=int, default=3, help="max GPT-2 line-review rounds")
     ap.add_argument("--model", default="gpt-5.5")
     ap.add_argument("--no-rotate", action="store_true")
     a = ap.parse_args()
