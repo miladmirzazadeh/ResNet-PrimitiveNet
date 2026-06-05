@@ -64,18 +64,26 @@ def dxf_to_prims(path):
     return prims
 
 
-def dense_filter(prims, k=6.0):
-    """Drop far-flung outlier primitives (title blocks, borders, north arrows, stray
-    marks) that would wreck per-plan normalization. Keeps the median +/- k*MAD spatial
-    cluster. On clean 14m chunks this keeps everything; on real drawings it rescues the
-    framing — the difference between '0 walls' and the real plan."""
-    arr = to_arrays(prims)
-    cx, cy = arr["C"][:, 0], arr["C"][:, 1]
-    mx, my = np.median(cx), np.median(cy)
-    madx = np.median(np.abs(cx - mx)) * 1.4826 + 1e-6
-    mady = np.median(np.abs(cy - my)) * 1.4826 + 1e-6
-    keep = (np.abs(cx - mx) < k * madx) & (np.abs(cy - my) < k * mady)
-    return [p for p, kk in zip(prims, keep) if kk]
+def dense_filter(prims, gap_ratio=5.0, core_frac=0.6):
+    """Drop far-flung outlier primitives (title blocks, borders, north arrows) WITHOUT
+    clipping the real plan. The plan is one spatially tight cluster; a title block sits
+    far away across a big distance GAP. We sort primitives by distance from the median
+    center and cut at the first large multiplicative jump in the outer tail — so a plan
+    with content spread over a wide area is kept whole, and only truly separated outliers
+    are removed. (The old MAD band wrongly clipped sparse walls beyond a dense fixture
+    cluster.)"""
+    if len(prims) < 8:
+        return prims
+    C = to_arrays(prims)["C"]
+    mx, my = np.median(C[:, 0]), np.median(C[:, 1])
+    d = np.hypot(C[:, 0] - mx, C[:, 1] - my)
+    ds = np.sort(d); n = len(ds)
+    start = int(n * core_frac)
+    ratios = ds[start + 1:] / np.maximum(ds[start:-1], 1.0)
+    if len(ratios) and ratios.max() > gap_ratio:
+        cut = ds[start + int(np.argmax(ratios))]      # last distance before the jump
+        return [p for p, kk in zip(prims, d <= cut) if kk]
+    return prims
 
 
 def deskew(prims):
