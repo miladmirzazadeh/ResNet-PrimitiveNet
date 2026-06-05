@@ -13,7 +13,7 @@ those per-line, re-render, and iterate. The model does the geometry; GPT renames
       --weights runs/v1/best.pt --input plan.dxf --out-dir gpt_out --iters 2 --model gpt-5.5
 """
 from __future__ import annotations
-import argparse, base64, json, os
+import argparse, base64, json, math, os
 from collections import Counter
 from pathlib import Path
 
@@ -285,20 +285,45 @@ def review_components(comps, ufo_img, original_img, model="gpt-5.5"):
     return out
 
 
-def _tiles(prims, threshold=80, target=45, overlap=0.12):
-    """Split the loose-line extent into an overlapping grid of tiles (~`target` lines each)
-    ONLY when the plan is dense: more than `threshold` loose lines. Below that, return None
-    and review the whole plan in one shot (a single zoomed view is plenty)."""
+def _num_chunks(n_loose, base=100):
+    """Dynamic chunk count by loose-line density (doubling): <=base -> 1 (no chunk),
+    >base -> 2, >2*base -> 4, >4*base -> 8, ... So with base=100: >100->2, >200->4, >400->8."""
+    if n_loose <= base:
+        return 1
+    k, t = 0, base
+    while n_loose > t:
+        k += 1; t *= 2
+    return 2 ** k
+
+
+def _grid(num, w, h):
+    """Factor `num` into rows x cols whose tile aspect best matches the plan (w x h)."""
+    best = None
+    for r in range(1, num + 1):
+        if num % r:
+            continue
+        c = num // r
+        ar = (w / c) / (h / r) if (h and r and c) else 1.0
+        score = abs(math.log(ar)) if ar > 0 else 1e9
+        if best is None or score < best[0]:
+            best = (score, r, c)
+    return best[1], best[2]
+
+
+def _tiles(prims, threshold=100, overlap=0.12):
+    """Overlapping grid of zoomed tiles, count chosen DYNAMICALLY by loose-line density
+    (see _num_chunks). Returns None when not dense enough (review the whole plan at once)."""
     loose = [p for p in prims if p.get("group") is None]
-    if len(loose) <= threshold:
+    num = _num_chunks(len(loose), base=threshold)
+    if num <= 1:
         return None
     xs = [c for p in loose for c in (p["x0"], p["x1"])]; ys = [c for p in loose for c in (p["y0"], p["y1"])]
     x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-    n = max(2, round((len(loose) / target) ** 0.5))
-    tw, th = (x1 - x0) / n, (y1 - y0) / n
+    rows, cols = _grid(num, x1 - x0, y1 - y0)
+    tw, th = (x1 - x0) / cols, (y1 - y0) / rows
     ox, oy = tw * overlap, th * overlap
     return [(x0 + c * tw - ox, y0 + r * th - oy, x0 + (c + 1) * tw + ox, y0 + (r + 1) * th + oy)
-            for r in range(n) for c in range(n)]
+            for r in range(rows) for c in range(cols)]
 
 
 def review_lines(prims, pred, idxs, images, model="gpt-5.5", tiled=False):
@@ -328,7 +353,7 @@ def review_lines(prims, pred, idxs, images, model="gpt-5.5", tiled=False):
 
 
 def supervise(model, prims, pred, out_dir, iters=3, gpt_model="gpt-5.5", device="cpu",
-              input_path=None, tile_threshold=80):
+              input_path=None, tile_threshold=100):
     """Two-stage GPT supervision:
       GPT #1 (objects): label each CAD block (UFO#) from the original + UFO-boxed image.
       GPT #2 (lines):   fix mislabeled LOOSE lines (walls/separators/glazing) by comparing
@@ -410,8 +435,8 @@ def main():
     ap.add_argument("--out-dir", default="gpt_out")
     ap.add_argument("--iters", type=int, default=3, help="max GPT-2 line-review rounds")
     ap.add_argument("--model", default="gpt-5.5")
-    ap.add_argument("--tile-threshold", type=int, default=80,
-                    help="only chunk the line review into zoomed tiles when loose lines exceed this")
+    ap.add_argument("--tile-threshold", type=int, default=100,
+                    help="base for dynamic chunking: >this->2 tiles, >2x->4, >4x->8, ...")
     ap.add_argument("--no-rotate", action="store_true")
     a = ap.parse_args()
     if not os.environ.get("OPENAI_API_KEY"):
