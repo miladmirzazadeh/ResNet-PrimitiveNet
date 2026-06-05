@@ -93,6 +93,45 @@ def render_original(prims, out, texts=None, figsize=(18, 14), dpi=160):
     return str(out)
 
 
+def build_components(prims, pred):
+    """Group primitives by their source CAD block (the drafter's own grouping). Each
+    block instance (window/door/fixture/furniture) becomes one labelable object UFO#.
+    Loose lines (group=None, e.g. walls) are NOT components — they keep per-line labels."""
+    from collections import defaultdict, Counter
+    g2idx = defaultdict(list)
+    for i, p in enumerate(prims):
+        if p.get("group") is not None:
+            g2idx[p["group"]].append(i)
+    comps = []
+    for n, (g, idx) in enumerate(sorted(g2idx.items()), start=1):
+        xs = [c for i in idx for c in (prims[i]["x0"], prims[i]["x1"])]
+        ys = [c for i in idx for c in (prims[i]["y0"], prims[i]["y1"])]
+        comps.append({
+            "ufo": "UFO%d" % n, "members": idx,
+            "bbox": [round(min(xs), 1), round(min(ys), 1), round(max(xs), 1), round(max(ys), 1)],
+            "layer": Counter(prims[i]["layer"] for i in idx).most_common(1)[0][0],
+            "block": prims[idx[0]].get("block", ""),
+            "model_guess": ID2NAME[int(Counter(int(pred[i]) for i in idx).most_common(1)[0][0])]})
+    return comps
+
+
+def render_ufo(prims, pred, comps, out, figsize=(18, 14), dpi=160):
+    """Plan colored by model class, with each component's bbox + UFO# tag overlaid."""
+    fig, ax = plt.subplots(figsize=figsize)
+    for i, p in enumerate(prims):
+        ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]],
+                color=CLASS_COLOR[int(pred[i]) % NUM_CLASSES], lw=1.1)
+    import matplotlib.patches as mpatches
+    for c in comps:
+        x0, y0, x1, y1 = c["bbox"]
+        ax.add_patch(mpatches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, ec="red", lw=1.0))
+        ax.text(x0, y1, c["ufo"], fontsize=8, color="red", ha="left", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="red", alpha=0.8))
+    ax.set_aspect("equal"); ax.axis("off")
+    plt.tight_layout(); plt.savefig(out, dpi=dpi); plt.close(fig)
+    return str(out)
+
+
 def _b64(path):
     return base64.b64encode(Path(path).read_bytes()).decode()
 
@@ -143,6 +182,50 @@ LINES TABLE:
 {table}"""
 
 
+COMP_PROMPT = """You are labeling OBJECTS in an architectural CAD floor plan. Each object
+is a CAD block (a window, door, fixture, or piece of furniture) that the drafter grouped;
+on the TAGGED image it is boxed in red with a tag UFO1, UFO2, .... You also get the
+ORIGINAL image in native CAD colors (with text labels and brightened layers).
+
+For each UFO you are given (JSON): its bounding box, the CAD layer it sits on, its block
+name, and the model's guess. Assign each UFO its TRUE class.
+
+Valid classes (use EXACTLY one): {classes}
+
+Strong hints, in order:
+- The CAD layer name is usually definitive: layer 'windows' -> 'glass'; 'doors' -> the
+  matching door class; 'R-TOILET-KITCHEN FITTINGS' or a fixture layer -> 'toilet'/'sink'/
+  'bathtub'/...; a furniture layer -> 'table'/'chair'/'bed'/'sofa'. But a layer CAN be
+  mislabeled, so confirm with the drawn shape and any nearby text label.
+- The drawn shape and the room text labels in the original image.
+
+Components to label:
+{components}
+
+Respond with JSON ONLY: {{"labels":[{{"ufo":"UFO1","class":"glass","reason":"on layer windows"}}]}}
+Label every UFO."""
+
+
+def review_components(comps, ufo_img, original_img, model="gpt-5.5"):
+    from openai import OpenAI
+    client = OpenAI()
+    compact = [{"ufo": c["ufo"], "bbox": c["bbox"], "layer": c["layer"],
+                "block": c["block"], "model_guess": c["model_guess"]} for c in comps]
+    prompt = COMP_PROMPT.format(classes=CLASS_LIST, components=json.dumps(compact))
+    content = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(original_img)}"}},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(ufo_img)}"}},
+    ]
+    data = json.loads(_chat(client, model, content).choices[0].message.content)
+    out = {}
+    for x in data.get("labels", []):
+        if x.get("ufo") and x.get("class") in NAME2ID:
+            out[x["ufo"]] = x["class"]
+            print(f"  {x['ufo']}: {x['class']}   ({str(x.get('reason',''))[:55]})")
+    return out
+
+
 def review_round(prims, pred, clean_img, marked_img, original_img, model="gpt-5.5"):
     from openai import OpenAI
     client = OpenAI()
@@ -166,29 +249,38 @@ def review_round(prims, pred, clean_img, marked_img, original_img, model="gpt-5.
     return changes
 
 
-def supervise(model, prims, pred, out_dir, iters=2, gpt_model="gpt-5.5", device="cpu",
+def supervise(model, prims, pred, out_dir, iters=1, gpt_model="gpt-5.5", device="cpu",
               input_path=None):
+    """Component-based GPT labeling: each CAD block (window/door/fixture/furniture) is one
+    UFO object that GPT labels as a whole (loose lines keep the transformer's per-line
+    labels). GPT reasons from the native CAD view (colors + text) + the UFO-tagged view +
+    each object's layer/block hints."""
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     texts = []
     if input_path and str(input_path).lower().endswith(".dxf"):
         from vtrue.infer import dxf_texts
         try:
-            texts = dxf_texts(input_path)
-            print(f"text labels overlaid: {len(texts)}")
+            texts = dxf_texts(input_path); print(f"text labels overlaid: {len(texts)}")
         except Exception:
             pass
-    original = render_original(prims, out / "original.png", texts=texts)   # native colors + text
-    for it in range(iters):
-        clean = render(prims, pred, out / f"clean_{it}.png", marked=False)
-        marked = render(prims, pred, out / f"marked_{it}.png", marked=True)
-        print(f"[round {it}] {len(prims)} lines -> {gpt_model} …")
-        ch = review_round(prims, pred, clean, marked, original, gpt_model)
-        if not ch:
-            print("  no changes; converged."); break
-        for i, c in ch.items():
-            pred[i] = c
+    original = render_original(prims, out / "original.png", texts=texts)
+    comps = build_components(prims, pred)
+    print(f"components (CAD blocks): {len(comps)}  | loose lines kept per-line: "
+          f"{sum(1 for p in prims if p.get('group') is None)}")
+    if comps:
+        ufo = render_ufo(prims, pred, comps, out / "ufo.png")
+        print(f"-> {gpt_model} labeling {len(comps)} objects …")
+        labels = review_components(comps, ufo, original, gpt_model)
+        for c in comps:
+            if c["ufo"] in labels:
+                cid = NAME2ID[labels[c["ufo"]]]
+                for i in c["members"]:
+                    pred[i] = cid
     render(prims, pred, out / "final.png", marked=False)
-    json.dump({"lines": lines_table(prims, pred)}, open(out / "labeled.json", "w"))
+    json.dump({"lines": lines_table(prims, pred),
+               "objects": [{**{k: c[k] for k in ("ufo", "bbox", "layer", "block")},
+                            "label": labels.get(c["ufo"], c["model_guess"]) if comps else c["model_guess"]}
+                           for c in comps]}, open(out / "labeled.json", "w"))
     print("final line classes:", dict(Counter(ID2NAME[int(c)] for c in pred)))
     print("done ->", out)
     return pred

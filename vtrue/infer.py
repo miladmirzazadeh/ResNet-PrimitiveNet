@@ -77,38 +77,70 @@ def dxf_to_prims(path):
     virtual_entities recursion mis-transforms those, scattering geometry far from the
     plan). Captures each leaf's native color ('rgb') and layer for the original CAD view."""
     import ezdxf
-    from ezdxf.disassemble import recursive_decompose
+    from ezdxf.math import Matrix44
     doc = ezdxf.readfile(path); msp = doc.modelspace()
     prims = []
 
-    def rec(t, x0, y0, x1, y1, cx, cy, r, rgb, layer):
+    def rec(t, x0, y0, x1, y1, cx, cy, r, rgb, layer, group, bname):
         prims.append({"t": t, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
                       "cx": cx, "cy": cy, "r": r, "rgb": rgb, "layer": layer,
-                      "sem": 0, "ins": ""})
+                      "group": group, "block": bname, "sem": 0, "ins": ""})
 
-    for e in recursive_decompose(list(msp)):
-        dt = e.dxftype()
-        rgb = _dxf_rgb(e, doc); layer = getattr(e.dxf, "layer", "0")
-        try:
-            if dt == "LINE":
-                a, b = e.dxf.start, e.dxf.end
-                rec("line", a.x, a.y, b.x, b.y, (a.x + b.x) / 2, (a.y + b.y) / 2, 0.0, rgb, layer)
-            elif dt == "ARC":
-                a, b = e.start_point, e.end_point; c = e.dxf.center
-                rec("arc", a.x, a.y, b.x, b.y, c.x, c.y, e.dxf.radius, rgb, layer)
-            elif dt in ("CIRCLE", "ELLIPSE"):
-                c = e.dxf.center; r = getattr(e.dxf, "radius", 0.0) or 1.0
-                rec("circle", c.x - r, c.y, c.x + r, c.y, c.x, c.y, r, rgb, layer)
-            elif dt in ("LWPOLYLINE", "POLYLINE"):
-                pts = [(p[0], p[1]) for p in e.get_points()] if dt == "LWPOLYLINE" \
-                      else [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
-                if getattr(e, "closed", False) and len(pts) > 2:
-                    pts = pts + [pts[0]]
-                for a, b in zip(pts, pts[1:]):
-                    if a != b:
-                        rec("line", a[0], a[1], b[0], b[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 0.0, rgb, layer)
-        except Exception:
-            pass
+    ID = Matrix44()
+
+    def explode(ins, parent_m):
+        """Recursively explode a block, yielding (entity, world_matrix). Explicit matrix
+        composition handles mirror + rotation correctly (ezdxf's recursive_decompose and
+        entity.transform() both mis-handle these blocks)."""
+        m = ins.matrix44() @ parent_m
+        blk = doc.blocks.get(ins.dxf.name)
+        if blk is None:
+            return
+        for e in blk:
+            if e.dxftype() == "INSERT":
+                yield from explode(e, m)
+            else:
+                yield e, m
+
+    def T(m, p):
+        v = m.transform(p); return v.x, v.y
+
+    # iterate TOP-LEVEL entities; each INSERT instance becomes one component group
+    # (the drafter's own grouping) so blocks (fixtures/doors/windows) can be labeled as
+    # whole objects. Loose entities (walls/lines) get group=None -> per-line handling.
+    gid = 0
+    for top in msp:
+        is_block = top.dxftype() == "INSERT"
+        group = ("G%d" % gid) if is_block else None
+        bname = top.dxf.name if is_block else ""
+        if is_block:
+            gid += 1
+        for e, m in (explode(top, ID) if is_block else [(top, ID)]):
+            dt = e.dxftype()
+            rgb = _dxf_rgb(e, doc); layer = getattr(e.dxf, "layer", "0")
+            try:
+                if dt == "LINE":
+                    a, b = T(m, e.dxf.start), T(m, e.dxf.end)
+                    rec("line", a[0], a[1], b[0], b[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 0.0, rgb, layer, group, bname)
+                elif dt == "ARC":
+                    a, b, c = T(m, e.start_point), T(m, e.end_point), T(m, e.dxf.center)
+                    r = m.transform_direction((e.dxf.radius, 0, 0)).magnitude
+                    rec("arc", a[0], a[1], b[0], b[1], c[0], c[1], r, rgb, layer, group, bname)
+                elif dt in ("CIRCLE", "ELLIPSE"):
+                    c = T(m, e.dxf.center); rr = getattr(e.dxf, "radius", 0.0) or 1.0
+                    r = m.transform_direction((rr, 0, 0)).magnitude
+                    rec("circle", c[0] - r, c[1], c[0] + r, c[1], c[0], c[1], r, rgb, layer, group, bname)
+                elif dt in ("LWPOLYLINE", "POLYLINE"):
+                    raw = [(p[0], p[1]) for p in e.get_points()] if dt == "LWPOLYLINE" \
+                          else [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+                    pts = [T(m, (x, y, 0)) for x, y in raw]
+                    if getattr(e, "closed", False) and len(pts) > 2:
+                        pts = pts + [pts[0]]
+                    for a, b in zip(pts, pts[1:]):
+                        if a != b:
+                            rec("line", a[0], a[1], b[0], b[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 0.0, rgb, layer, group, bname)
+            except Exception:
+                pass
     return prims
 
 
