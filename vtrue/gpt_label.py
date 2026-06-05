@@ -285,11 +285,12 @@ def review_components(comps, ufo_img, original_img, model="gpt-5.5"):
     return out
 
 
-def _tiles(prims, target=45, overlap=0.12):
-    """Split the loose-line extent into an overlapping grid of tiles, sized so each holds
-    ~`target` lines. Returns None for small plans (review whole at once)."""
+def _tiles(prims, threshold=80, target=45, overlap=0.12):
+    """Split the loose-line extent into an overlapping grid of tiles (~`target` lines each)
+    ONLY when the plan is dense: more than `threshold` loose lines. Below that, return None
+    and review the whole plan in one shot (a single zoomed view is plenty)."""
     loose = [p for p in prims if p.get("group") is None]
-    if len(loose) <= target * 1.6:
+    if len(loose) <= threshold:
         return None
     xs = [c for p in loose for c in (p["x0"], p["x1"])]; ys = [c for p in loose for c in (p["y0"], p["y1"])]
     x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
@@ -327,7 +328,7 @@ def review_lines(prims, pred, idxs, images, model="gpt-5.5", tiled=False):
 
 
 def supervise(model, prims, pred, out_dir, iters=3, gpt_model="gpt-5.5", device="cpu",
-              input_path=None):
+              input_path=None, tile_threshold=80):
     """Two-stage GPT supervision:
       GPT #1 (objects): label each CAD block (UFO#) from the original + UFO-boxed image.
       GPT #2 (lines):   fix mislabeled LOOSE lines (walls/separators/glazing) by comparing
@@ -363,10 +364,10 @@ def supervise(model, prims, pred, out_dir, iters=3, gpt_model="gpt-5.5", device=
     #      ZOOMED TILES (each with a whole-plan thumbnail for context) instead of the whole
     #      plan at once, so labels are readable and GPT sees the detail. ----
     if n_loose:
-        tiles = _tiles(prims)
+        tiles = _tiles(prims, threshold=tile_threshold)
         thumb = render(prims, pred, out / "context.png", marked=False)        # whole-plan context
         if tiles:
-            print(f"[GPT-2 lines] large plan -> {len(tiles)} zoomed tiles")
+            print(f"[GPT-2 lines] dense plan ({n_loose} > {tile_threshold}) -> {len(tiles)} zoomed tiles")
             for ti, b in enumerate(tiles):
                 idxs = [i for i, p in enumerate(prims) if p.get("group") is None and _in_bbox(p, b)]
                 if len(idxs) < 2:
@@ -381,6 +382,7 @@ def supervise(model, prims, pred, out_dir, iters=3, gpt_model="gpt-5.5", device=
                     for i, cid in changes.items():
                         pred[i] = cid
         else:
+            print(f"[GPT-2 lines] not dense ({n_loose} <= {tile_threshold}) -> whole-plan review")
             idxs = [i for i, p in enumerate(prims) if p.get("group") is None]
             for it in range(max(1, iters)):
                 clean = render(prims, pred, out / "highlighted.png", marked=False)
@@ -408,6 +410,8 @@ def main():
     ap.add_argument("--out-dir", default="gpt_out")
     ap.add_argument("--iters", type=int, default=3, help="max GPT-2 line-review rounds")
     ap.add_argument("--model", default="gpt-5.5")
+    ap.add_argument("--tile-threshold", type=int, default=80,
+                    help="only chunk the line review into zoomed tiles when loose lines exceed this")
     ap.add_argument("--no-rotate", action="store_true")
     a = ap.parse_args()
     if not os.environ.get("OPENAI_API_KEY"):
@@ -419,7 +423,8 @@ def main():
         raise SystemExit("no primitives")
     pred, prims = label_plan(model, prims, device, rotate=not a.no_rotate)
     print("model line classes:", dict(Counter(ID2NAME[int(c)] for c in pred)))
-    supervise(model, prims, pred, a.out_dir, a.iters, a.model, device, input_path=a.input)
+    supervise(model, prims, pred, a.out_dir, a.iters, a.model, device,
+              input_path=a.input, tile_threshold=a.tile_threshold)
 
 
 if __name__ == "__main__":
