@@ -87,9 +87,12 @@ Valid classes (use EXACTLY one of these strings): {classes}
 Read the drawing like an architect and decide what each line REALLY is. Then report
 ONLY the lines whose label should CHANGE. Use the MARKED image to translate your
 visual judgment into line ids. Guidance:
-- A wall is one line, or TWO parallel lines a small fixed distance apart (its faces).
-- A window = thin parallel glazing lines bridging a gap in an exterior wall -> 'glass'
-  (NOT 'wall'). A door = a leaf line + its swing arc inside a wall opening.
+- A wall is one line, or TWO/THREE parallel lines a small distance apart (its faces).
+- A window ('glass') is a SHORT section of thin parallel lines that BRIDGES AN OPENING
+  in a wall, with solid wall on BOTH sides of it. Closely-spaced parallel lines are
+  NOT automatically glass: if they run continuously along a long edge / the building
+  perimeter (no opening), they are a WALL, not a window. Relabel such 'glass' -> 'wall'.
+- A door = a leaf line + its swing arc inside a wall opening.
 - Fixtures (toilet/sink/urinal/bathtub/squat_toilet), furniture (bed/sofa/table/chair),
   stairs, columns, holes — name them by their drawn shape.
 - Lines mislabeled 'others' that clearly belong to a real class are the main target.
