@@ -47,26 +47,36 @@ def lines_table(prims, pred, only_loose=False):
             for i, p in enumerate(prims) if not (only_loose and p.get("group") is not None)]
 
 
-def render_lines(prims, pred, out, figsize=(18, 14), dpi=170):
-    """Class-colored 'highlighted' plan with L# tags on the LOOSE lines only (block lines
-    are UFO objects, handled separately). Each tag is placed BESIDE its line (perpendicular
-    offset) with a faint background, so labels don't sit on top of the linework."""
+def _in_bbox(p, b):
+    mx, my = (p["x0"] + p["x1"]) / 2, (p["y0"] + p["y1"]) / 2
+    return b[0] <= mx <= b[2] and b[1] <= my <= b[3]
+
+
+def render_lines(prims, pred, out, bbox=None, figsize=(18, 14), dpi=170):
+    """Class-colored 'highlighted' plan with L# tags on the LOOSE lines (block lines are UFO
+    objects, handled separately). bbox=(x0,y0,x1,y1) zooms to a tile and only tags the loose
+    lines inside it. Tags sit beside the line (perpendicular offset) with a faint background."""
     fig, ax = plt.subplots(figsize=figsize)
     for i, p in enumerate(prims):
         ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]],
-                color=CLASS_COLOR[int(pred[i]) % NUM_CLASSES], lw=1.1)
-    ax.set_aspect("equal"); ax.autoscale()
+                color=CLASS_COLOR[int(pred[i]) % NUM_CLASSES], lw=1.4 if bbox else 1.1)
+    ax.set_aspect("equal")
+    if bbox is None:
+        ax.autoscale()
+    else:
+        mx, my = (bbox[2] - bbox[0]) * 0.04, (bbox[3] - bbox[1]) * 0.04
+        ax.set_xlim(bbox[0] - mx, bbox[2] + mx); ax.set_ylim(bbox[1] - my, bbox[3] + my)
     span = max(ax.get_xlim()[1] - ax.get_xlim()[0], ax.get_ylim()[1] - ax.get_ylim()[0]) or 1.0
-    off = span * 0.006
+    off = span * 0.008
     for i, p in enumerate(prims):
-        if p.get("group") is not None:
+        if p.get("group") is not None or (bbox is not None and not _in_bbox(p, bbox)):
             continue
         mx, my = (p["x0"] + p["x1"]) / 2, (p["y0"] + p["y1"]) / 2
         dx, dy = p["x1"] - p["x0"], p["y1"] - p["y0"]; L = (dx * dx + dy * dy) ** 0.5 or 1.0
         nx, ny = -dy / L, dx / L                       # unit normal -> label sits beside the line
-        ax.text(mx + nx * off, my + ny * off, f"L{i}", fontsize=4, color="black",
+        ax.text(mx + nx * off, my + ny * off, f"L{i}", fontsize=6 if bbox else 4, color="black",
                 ha="center", va="center",
-                bbox=dict(boxstyle="square,pad=0.04", fc="white", ec="none", alpha=0.55))
+                bbox=dict(boxstyle="square,pad=0.05", fc="white", ec="none", alpha=0.6))
     ax.axis("off"); plt.tight_layout(); plt.savefig(out, dpi=dpi); plt.close(fig)
     return str(out)
 
@@ -95,10 +105,10 @@ def _visible(rgb, floor=170):
     return tuple(min(1.0, v / 255) for v in rgb)
 
 
-def render_original(prims, out, texts=None, figsize=(18, 14), dpi=160):
+def render_original(prims, out, texts=None, bbox=None, figsize=(18, 14), dpi=160):
     """Complete native CAD view: every line in its ORIGINAL DXF color (dark colors
     brightened) PLUS the drawing's text labels, on a dark background like a CAD viewer.
-    Colors, layers, and text all carry intent GPT uses (red=separator; label 'toilet')."""
+    bbox=(x0,y0,x1,y1) zooms to a tile. Colors/layers/text carry intent GPT uses."""
     fig, ax = plt.subplots(figsize=figsize, facecolor="black")
     ax.set_facecolor("black")
     xs, ys = [], []
@@ -106,11 +116,16 @@ def render_original(prims, out, texts=None, figsize=(18, 14), dpi=160):
         ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]],
                 color=_visible(p.get("rgb", (255, 255, 255))), lw=1.0)
         xs += [p["x0"], p["x1"]]; ys += [p["y0"], p["y1"]]
-    if texts and xs:
-        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-        mx, my = (x1 - x0) * 0.15 + 1, (y1 - y0) * 0.15 + 1
-        for t in texts:                                  # only labels within/near the plan
-            if x0 - mx <= t["x"] <= x1 + mx and y0 - my <= t["y"] <= y1 + my:
+    if bbox is None:
+        bx0, by0, bx1, by1 = (min(xs), min(ys), max(xs), max(ys)) if xs else (0, 0, 1, 1)
+    else:
+        bx0, by0, bx1, by1 = bbox
+        mx, my = (bx1 - bx0) * 0.04, (by1 - by0) * 0.04
+        ax.set_xlim(bx0 - mx, bx1 + mx); ax.set_ylim(by0 - my, by1 + my)
+    if texts:
+        tm = ((bx1 - bx0) * 0.15 + 1, (by1 - by0) * 0.15 + 1) if bbox else (0, 0)
+        for t in texts:
+            if bx0 - tm[0] <= t["x"] <= bx1 + tm[0] and by0 - tm[1] <= t["y"] <= by1 + tm[1]:
                 ax.text(t["x"], t["y"], t["s"], color=_visible(t.get("rgb", (200, 200, 200))),
                         fontsize=7, ha="left", va="bottom", clip_on=True)
     ax.set_aspect("equal"); ax.axis("off")
@@ -270,27 +285,44 @@ def review_components(comps, ufo_img, original_img, model="gpt-5.5"):
     return out
 
 
-def review_lines(prims, pred, clean_img, marked_img, original_img, model="gpt-5.5"):
-    """GPT #2 — fix mislabeled LOOSE lines (walls/separators/glazing). Returns {idx: class}."""
+def _tiles(prims, target=45, overlap=0.12):
+    """Split the loose-line extent into an overlapping grid of tiles, sized so each holds
+    ~`target` lines. Returns None for small plans (review whole at once)."""
+    loose = [p for p in prims if p.get("group") is None]
+    if len(loose) <= target * 1.6:
+        return None
+    xs = [c for p in loose for c in (p["x0"], p["x1"])]; ys = [c for p in loose for c in (p["y0"], p["y1"])]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    n = max(2, round((len(loose) / target) ** 0.5))
+    tw, th = (x1 - x0) / n, (y1 - y0) / n
+    ox, oy = tw * overlap, th * overlap
+    return [(x0 + c * tw - ox, y0 + r * th - oy, x0 + (c + 1) * tw + ox, y0 + (r + 1) * th + oy)
+            for r in range(n) for c in range(n)]
+
+
+def review_lines(prims, pred, idxs, images, model="gpt-5.5", tiled=False):
+    """GPT #2 — fix mislabeled LOOSE lines among `idxs`, shown in `images`. Returns {idx:class}."""
     from openai import OpenAI
     client = OpenAI()
-    table = lines_table(prims, pred, only_loose=True)
-    prompt = LINE_PROMPT.format(legend=json.dumps(legend()), classes=CLASS_LIST, table=json.dumps(table))
-    content = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(original_img)}"}},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(clean_img)}"}},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(marked_img)}"}},
-    ]
+    table = [{"id": f"L{i}", "model_guess": ID2NAME.get(int(pred[i]), str(int(pred[i]))),
+              "layer": prims[i].get("layer", ""),
+              "coords": [round(prims[i]["x0"], 1), round(prims[i]["y0"], 1),
+                         round(prims[i]["x1"], 1), round(prims[i]["y1"], 1)]} for i in idxs]
+    note = ("\nNOTE: the FIRST image is a whole-plan thumbnail for CONTEXT; the others are a "
+            "ZOOMED tile — only correct the lines listed in the table (they are in this tile).\n"
+            if tiled else "")
+    prompt = note + LINE_PROMPT.format(legend=json.dumps(legend()), classes=CLASS_LIST, table=json.dumps(table))
+    content = [{"type": "text", "text": prompt}] + [
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(im)}"}} for im in images]
     data = json.loads(_chat(client, model, content).choices[0].message.content)
-    changes = {}
+    allow = set(idxs); changes = {}
     for c in data.get("changes", []):
         cid = str(c.get("id", "")); to = c.get("to")
         if cid.startswith("L") and cid[1:].isdigit() and to in NAME2ID:
-            idx = int(cid[1:])
-            if 0 <= idx < len(prims) and prims[idx].get("group") is None:   # loose only
-                changes[idx] = NAME2ID[to]
-                print(f"  {cid}: -> {to}   ({str(c.get('reason', ''))[:55]})")
+            i = int(cid[1:])
+            if i in allow:
+                changes[i] = NAME2ID[to]
+                print(f"  {cid}: -> {to}   ({str(c.get('reason', ''))[:50]})")
     return changes
 
 
@@ -327,18 +359,38 @@ def supervise(model, prims, pred, out_dir, iters=3, gpt_model="gpt-5.5", device=
                 for i in c["members"]:
                     pred[i] = cid
 
-    # ---- GPT #2: fix the LOOSE LINES, ITERATING (change only what's wrong, re-render,
-    #      look again) until GPT reports no more changes or we hit max iters ----
+    # ---- GPT #2: fix the LOOSE LINES, ITERATING until converged. For big plans, review
+    #      ZOOMED TILES (each with a whole-plan thumbnail for context) instead of the whole
+    #      plan at once, so labels are readable and GPT sees the detail. ----
     if n_loose:
-        for it in range(max(1, iters)):
-            clean = render(prims, pred, out / "highlighted.png", marked=False)
-            marked = render_lines(prims, pred, out / "marked_lines.png")
-            print(f"[GPT-2 lines · round {it + 1}/{iters}] reviewing {n_loose} loose lines …")
-            changes = review_lines(prims, pred, clean, marked, original, gpt_model)
-            if not changes:
-                print("  no more changes — converged."); break
-            for i, cid in changes.items():
-                pred[i] = cid
+        tiles = _tiles(prims)
+        thumb = render(prims, pred, out / "context.png", marked=False)        # whole-plan context
+        if tiles:
+            print(f"[GPT-2 lines] large plan -> {len(tiles)} zoomed tiles")
+            for ti, b in enumerate(tiles):
+                idxs = [i for i, p in enumerate(prims) if p.get("group") is None and _in_bbox(p, b)]
+                if len(idxs) < 2:
+                    continue
+                for it in range(max(1, iters)):
+                    hl = render_lines(prims, pred, out / f"tile{ti}_hl.png", bbox=b)
+                    org = render_original(prims, out / f"tile{ti}_orig.png", texts=texts, bbox=b)
+                    print(f"  tile {ti + 1}/{len(tiles)} · round {it + 1}: {len(idxs)} lines …")
+                    changes = review_lines(prims, pred, idxs, [thumb, org, hl], gpt_model, tiled=True)
+                    if not changes:
+                        break
+                    for i, cid in changes.items():
+                        pred[i] = cid
+        else:
+            idxs = [i for i, p in enumerate(prims) if p.get("group") is None]
+            for it in range(max(1, iters)):
+                clean = render(prims, pred, out / "highlighted.png", marked=False)
+                marked = render_lines(prims, pred, out / "marked_lines.png")
+                print(f"[GPT-2 lines · round {it + 1}/{iters}] reviewing {n_loose} loose lines …")
+                changes = review_lines(prims, pred, idxs, [original, clean, marked], gpt_model)
+                if not changes:
+                    print("  no more changes — converged."); break
+                for i, cid in changes.items():
+                    pred[i] = cid
 
     render(prims, pred, out / "final.png", marked=False)
     json.dump({"objects": [{**{k: c[k] for k in ("ufo", "bbox", "layer", "block")},
