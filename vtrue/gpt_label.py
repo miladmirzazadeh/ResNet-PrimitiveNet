@@ -70,15 +70,24 @@ def _visible(rgb, floor=170):
     return tuple(min(1.0, v / 255) for v in rgb)
 
 
-def render_original(prims, out, figsize=(18, 14), dpi=160):
-    """Native CAD view: each line in its ORIGINAL DXF color (dark colors brightened) on a
-    dark background (like a CAD viewer). The drafter's colors carry intent GPT can use
-    (red separator vs wall; doors/windows in their layer color)."""
+def render_original(prims, out, texts=None, figsize=(18, 14), dpi=160):
+    """Complete native CAD view: every line in its ORIGINAL DXF color (dark colors
+    brightened) PLUS the drawing's text labels, on a dark background like a CAD viewer.
+    Colors, layers, and text all carry intent GPT uses (red=separator; label 'toilet')."""
     fig, ax = plt.subplots(figsize=figsize, facecolor="black")
     ax.set_facecolor("black")
+    xs, ys = [], []
     for p in prims:
         ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]],
                 color=_visible(p.get("rgb", (255, 255, 255))), lw=1.0)
+        xs += [p["x0"], p["x1"]]; ys += [p["y0"], p["y1"]]
+    if texts and xs:
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        mx, my = (x1 - x0) * 0.15 + 1, (y1 - y0) * 0.15 + 1
+        for t in texts:                                  # only labels within/near the plan
+            if x0 - mx <= t["x"] <= x1 + mx and y0 - my <= t["y"] <= y1 + my:
+                ax.text(t["x"], t["y"], t["s"], color=_visible(t.get("rgb", (200, 200, 200))),
+                        fontsize=7, ha="left", va="bottom", clip_on=True)
     ax.set_aspect("equal"); ax.axis("off")
     plt.tight_layout(); plt.savefig(out, dpi=dpi, facecolor="black"); plt.close(fig)
     return str(out)
@@ -157,9 +166,18 @@ def review_round(prims, pred, clean_img, marked_img, original_img, model="gpt-5.
     return changes
 
 
-def supervise(model, prims, pred, out_dir, iters=2, gpt_model="gpt-5.5", device="cpu"):
+def supervise(model, prims, pred, out_dir, iters=2, gpt_model="gpt-5.5", device="cpu",
+              input_path=None):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-    original = render_original(prims, out / "original.png")     # native CAD colors (fixed)
+    texts = []
+    if input_path and str(input_path).lower().endswith(".dxf"):
+        from vtrue.infer import dxf_texts
+        try:
+            texts = dxf_texts(input_path)
+            print(f"text labels overlaid: {len(texts)}")
+        except Exception:
+            pass
+    original = render_original(prims, out / "original.png", texts=texts)   # native colors + text
     for it in range(iters):
         clean = render(prims, pred, out / f"clean_{it}.png", marked=False)
         marked = render(prims, pred, out / f"marked_{it}.png", marked=True)
@@ -194,7 +212,7 @@ def main():
         raise SystemExit("no primitives")
     pred, prims = label_plan(model, prims, device, rotate=not a.no_rotate)
     print("model line classes:", dict(Counter(ID2NAME[int(c)] for c in pred)))
-    supervise(model, prims, pred, a.out_dir, a.iters, a.model, device)
+    supervise(model, prims, pred, a.out_dir, a.iters, a.model, device, input_path=a.input)
 
 
 if __name__ == "__main__":

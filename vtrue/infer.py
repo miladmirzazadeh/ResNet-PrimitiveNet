@@ -22,59 +22,83 @@ from vtrue.archcad import load_chunk
 from vtrue.classes import ID2NAME, NUM_CLASSES
 
 
-def dxf_to_prims(path):
-    """Minimal DXF -> record list (same schema as archcad.load_chunk). sem=0 (unknown).
-    Captures each entity's native color ('rgb') so the original CAD view can be shown
-    to GPT — the drafter's colors carry intent (e.g. a red line = separator, not wall)."""
-    import ezdxf
+def _dxf_rgb(e, doc):
+    """Native color of a DXF entity (true color, else ACI, else its layer's color)."""
     from ezdxf.colors import aci2rgb
-    doc = ezdxf.readfile(path); msp = doc.modelspace()
-    prims = []
-    cur = {"rgb": (255, 255, 255)}
+    try:
+        if e.rgb:
+            return tuple(int(v) for v in e.rgb)
+    except Exception:
+        pass
+    try:
+        c = int(e.dxf.color)
+        if c == 256:                                    # BYLAYER
+            lay = doc.layers.get(e.dxf.layer)
+            if getattr(lay, "rgb", None):
+                return tuple(int(v) for v in lay.rgb)
+            c = int(lay.color)
+        if c in (0, 7, 256):                            # byblock / default white
+            return (255, 255, 255)
+        return tuple(int(v) for v in aci2rgb(abs(c)))
+    except Exception:
+        return (255, 255, 255)
 
-    def entity_rgb(e):
+
+def dxf_texts(path):
+    """Extract TEXT/MTEXT as {x,y,s,rgb,layer} — the drawing's labels (room names,
+    'toilet', dimensions). NOT fed to the model; overlaid on the original view for GPT,
+    because a text label next to a fixture is the most definitive class hint there is."""
+    import ezdxf
+    doc = ezdxf.readfile(path); msp = doc.modelspace()
+    out = []
+    for e in msp:
+        dt = e.dxftype()
         try:
-            if e.rgb:                                   # explicit true color
-                return tuple(int(v) for v in e.rgb)
+            if dt == "TEXT":
+                p = e.dxf.insert; s = e.dxf.text
+            elif dt == "MTEXT":
+                p = e.dxf.insert; s = e.plain_text() if hasattr(e, "plain_text") else e.text
+            else:
+                continue
+            s = (s or "").strip()
+            if s:
+                out.append({"x": float(p.x), "y": float(p.y), "s": s,
+                            "rgb": _dxf_rgb(e, doc), "layer": getattr(e.dxf, "layer", "")})
         except Exception:
             pass
-        try:
-            c = int(e.dxf.color)
-            if c == 256:                                # BYLAYER
-                lay = doc.layers.get(e.dxf.layer)
-                if getattr(lay, "rgb", None):
-                    return tuple(int(v) for v in lay.rgb)
-                c = int(lay.color)
-            if c in (0, 7, 256):                        # byblock / default white
-                return (255, 255, 255)
-            return tuple(int(v) for v in aci2rgb(abs(c)))
-        except Exception:
-            return (255, 255, 255)
+    return out
 
-    def rec(t, x0, y0, x1, y1, cx, cy, r):
+
+def dxf_to_prims(path):
+    """DXF -> record list (same schema as archcad.load_chunk). sem=0 (unknown).
+
+    Uses ezdxf.recursive_decompose to flatten nested blocks into WCS leaf entities —
+    this correctly handles mirrored / rotated / deeply-nested INSERTs (manual
+    virtual_entities recursion mis-transforms those, scattering geometry far from the
+    plan). Captures each leaf's native color ('rgb') and layer for the original CAD view."""
+    import ezdxf
+    from ezdxf.disassemble import recursive_decompose
+    doc = ezdxf.readfile(path); msp = doc.modelspace()
+    prims = []
+
+    def rec(t, x0, y0, x1, y1, cx, cy, r, rgb, layer):
         prims.append({"t": t, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-                      "cx": cx, "cy": cy, "r": r, "rgb": cur["rgb"], "sem": 0, "ins": ""})
+                      "cx": cx, "cy": cy, "r": r, "rgb": rgb, "layer": layer,
+                      "sem": 0, "ins": ""})
 
-    def walk(e, depth=0):
+    for e in recursive_decompose(list(msp)):
         dt = e.dxftype()
-        if dt == "INSERT" and depth < 4:
-            try:
-                for ve in e.virtual_entities():
-                    walk(ve, depth + 1)
-            except Exception:
-                pass
-            return
-        cur["rgb"] = entity_rgb(e)
+        rgb = _dxf_rgb(e, doc); layer = getattr(e.dxf, "layer", "0")
         try:
             if dt == "LINE":
                 a, b = e.dxf.start, e.dxf.end
-                rec("line", a.x, a.y, b.x, b.y, (a.x + b.x) / 2, (a.y + b.y) / 2, 0.0)
+                rec("line", a.x, a.y, b.x, b.y, (a.x + b.x) / 2, (a.y + b.y) / 2, 0.0, rgb, layer)
             elif dt == "ARC":
                 a, b = e.start_point, e.end_point; c = e.dxf.center
-                rec("arc", a.x, a.y, b.x, b.y, c.x, c.y, e.dxf.radius)
+                rec("arc", a.x, a.y, b.x, b.y, c.x, c.y, e.dxf.radius, rgb, layer)
             elif dt in ("CIRCLE", "ELLIPSE"):
                 c = e.dxf.center; r = getattr(e.dxf, "radius", 0.0) or 1.0
-                rec("circle", c.x - r, c.y, c.x + r, c.y, c.x, c.y, r)
+                rec("circle", c.x - r, c.y, c.x + r, c.y, c.x, c.y, r, rgb, layer)
             elif dt in ("LWPOLYLINE", "POLYLINE"):
                 pts = [(p[0], p[1]) for p in e.get_points()] if dt == "LWPOLYLINE" \
                       else [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
@@ -82,11 +106,9 @@ def dxf_to_prims(path):
                     pts = pts + [pts[0]]
                 for a, b in zip(pts, pts[1:]):
                     if a != b:
-                        rec("line", a[0], a[1], b[0], b[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 0.0)
+                        rec("line", a[0], a[1], b[0], b[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 0.0, rgb, layer)
         except Exception:
             pass
-    for e in msp:
-        walk(e)
     return prims
 
 
