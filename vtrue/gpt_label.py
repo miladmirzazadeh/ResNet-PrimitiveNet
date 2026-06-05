@@ -60,15 +60,25 @@ def render(prims, pred, out, marked=False, figsize=(18, 14), dpi=160):
     return str(out)
 
 
+def _visible(rgb, floor=170):
+    """Brighten dark DXF colors (preserving hue) so they're visible on a black bg — many
+    CAD layers use dark ACI colors that a viewer auto-brightens but raw RGB does not."""
+    m = max(rgb) or 1
+    if m < floor:
+        s = floor / m
+        rgb = tuple(min(255, int(v * s)) for v in rgb)
+    return tuple(min(1.0, v / 255) for v in rgb)
+
+
 def render_original(prims, out, figsize=(18, 14), dpi=160):
-    """Native CAD view: each line in its ORIGINAL DXF color on a dark background (like a
-    CAD viewer). The drafter's colors carry intent GPT can use (red separator vs wall)."""
+    """Native CAD view: each line in its ORIGINAL DXF color (dark colors brightened) on a
+    dark background (like a CAD viewer). The drafter's colors carry intent GPT can use
+    (red separator vs wall; doors/windows in their layer color)."""
     fig, ax = plt.subplots(figsize=figsize, facecolor="black")
     ax.set_facecolor("black")
     for p in prims:
-        rgb = p.get("rgb", (255, 255, 255))
         ax.plot([p["x0"], p["x1"]], [p["y0"], p["y1"]],
-                color=tuple(min(1.0, v / 255) for v in rgb), lw=1.0)
+                color=_visible(p.get("rgb", (255, 255, 255))), lw=1.0)
     ax.set_aspect("equal"); ax.axis("off")
     plt.tight_layout(); plt.savefig(out, dpi=dpi, facecolor="black"); plt.close(fig)
     return str(out)
